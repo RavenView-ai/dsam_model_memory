@@ -299,6 +299,9 @@
 </style>
 
 <script>
+// Global network instance - declare before using
+let networkGraph = null;
+
 // Load initial stats
 document.addEventListener('DOMContentLoaded', function() {
     loadStats();
@@ -685,9 +688,6 @@ class NetworkGraph {
         return colors[type] || '#00ffff';
     }
 }
-
-// Global network instance
-let networkGraph = null;
 
 // Load and draw network
 async function loadAndDrawNetwork(type) {

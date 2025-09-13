@@ -30,7 +30,7 @@ class BaseLlamaServerConfig:
     port: int = 8000
     context_size: int = 20480
     threads: int = 1
-    
+
     # GPU/VRAM optimization settings
     n_gpu_layers: int = -1  # Use ALL layers on GPU
     no_mmap: bool = True  # Keep entire model in VRAM
@@ -81,14 +81,31 @@ class LLMServerConfig(BaseLlamaServerConfig):
             config.context_size = int(os.getenv("AM_CONTEXT_WINDOW"))
         if os.getenv("AM_GPU_LAYERS"):
             config.n_gpu_layers = int(os.getenv("AM_GPU_LAYERS"))
-        if os.getenv("AM_LLAMA_BATCH_SIZE"):
+        if os.getenv("AM_THREADS"):
+            config.threads = int(os.getenv("AM_THREADS"))
+
+        # Batch processing settings
+        if os.getenv("AM_BATCH_SIZE"):
+            config.batch_size = int(os.getenv("AM_BATCH_SIZE"))
+        elif os.getenv("AM_LLAMA_BATCH_SIZE"):  # Backward compatibility
             config.batch_size = int(os.getenv("AM_LLAMA_BATCH_SIZE"))
-        if os.getenv("AM_LLAMA_UBATCH_SIZE"):
+
+        if os.getenv("AM_UBATCH_SIZE"):
+            config.ubatch_size = int(os.getenv("AM_UBATCH_SIZE"))
+        elif os.getenv("AM_LLAMA_UBATCH_SIZE"):  # Backward compatibility
             config.ubatch_size = int(os.getenv("AM_LLAMA_UBATCH_SIZE"))
+
+        # Performance optimization settings
         if os.getenv("AM_CONTINUOUS_BATCHING"):
             config.continuous_batching = os.getenv("AM_CONTINUOUS_BATCHING").lower() in ("true", "1", "yes")
         if os.getenv("AM_PARALLEL_SEQUENCES"):
             config.parallel_sequences = int(os.getenv("AM_PARALLEL_SEQUENCES"))
+        if os.getenv("AM_NO_MMAP"):
+            config.no_mmap = os.getenv("AM_NO_MMAP").lower() in ("true", "1", "yes")
+        if os.getenv("AM_MLOCK"):
+            config.lock_memory = os.getenv("AM_MLOCK").lower() in ("true", "1", "yes")
+        if os.getenv("AM_FLASH_ATTENTION"):
+            config.flash_attention = os.getenv("AM_FLASH_ATTENTION").lower() in ("true", "1", "yes")
             
         return config
 

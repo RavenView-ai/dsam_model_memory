@@ -979,6 +979,39 @@ input:checked + .toggle-slider:before {
                 0 loaded
             </span>
         </div>
+
+        <!-- Chat State Indicator -->
+        <div id="chat-state-indicator" style="
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: rgba(0, 255, 255, 0.1);
+            border: 1px solid var(--synth-cyan);
+            border-radius: 8px;
+            margin-left: 1rem;
+            font-size: 0.75rem;
+            color: var(--synth-cyan);
+            opacity: 0.8;
+            transition: all 0.3s ease;
+        ">
+            <span style="animation: pulse 2s infinite;">●</span>
+            <span>State preserved</span>
+            <button onclick="clearChatState()" style="
+                background: transparent;
+                border: 1px solid var(--synth-pink);
+                color: var(--synth-pink);
+                padding: 0.25rem 0.5rem;
+                border-radius: 4px;
+                font-size: 0.7rem;
+                cursor: pointer;
+                margin-left: 0.5rem;
+                transition: all 0.3s ease;
+            " onmouseover="this.style.background='rgba(255, 16, 240, 0.2)'"
+               onmouseout="this.style.background='transparent'">
+                Clear
+            </button>
+        </div>
     </div>
     
     <div class="chat-main">
@@ -2184,5 +2217,123 @@ async function exportChat() {
     a.click();
     URL.revokeObjectURL(url);
 }
+
+// Integration with Tab Manager
+function clearChatState() {
+    if (window.tabManager) {
+        window.tabManager.clearState();
+
+        // Clear the UI
+        const chatMessages = document.getElementById('chat-messages');
+        if (chatMessages) {
+            chatMessages.innerHTML = `
+                <div class="message system">
+                    <div class="message-content">
+                        Chat cleared. Starting a new conversation.
+                    </div>
+                </div>
+            `;
+        }
+
+        // Clear input
+        const chatInput = document.getElementById('chat-input');
+        if (chatInput) {
+            chatInput.value = '';
+        }
+
+        // Reset session
+        currentSessionId = generateSessionId();
+        messageHistory = [];
+        currentMemories = [];
+
+        // Update UI indicator
+        updateStateIndicator(false);
+    }
+}
+
+function updateStateIndicator(hasState = true) {
+    const indicator = document.getElementById('chat-state-indicator');
+    if (indicator) {
+        if (hasState && window.tabManager && window.tabManager.chatState) {
+            indicator.style.display = 'flex';
+            indicator.style.opacity = '0.8';
+        } else {
+            indicator.style.opacity = '0.3';
+            setTimeout(() => {
+                if (indicator) {
+                    indicator.style.display = 'none';
+                }
+            }, 300);
+        }
+    }
+}
+
+// Save state periodically and on important events
+let saveStateTimer = null;
+function scheduleSaveState() {
+    if (saveStateTimer) {
+        clearTimeout(saveStateTimer);
+    }
+    saveStateTimer = setTimeout(() => {
+        if (window.tabManager) {
+            window.tabManager.saveState();
+            updateStateIndicator(true);
+        }
+    }, 500); // Debounce for 500ms
+}
+
+// Hook into existing functions to save state
+const originalSendMessage = window.sendMessage;
+if (originalSendMessage) {
+    window.sendMessage = async function() {
+        const result = await originalSendMessage.apply(this, arguments);
+        scheduleSaveState();
+        return result;
+    };
+}
+
+// Save state when user types
+document.getElementById('chat-input')?.addEventListener('input', () => {
+    scheduleSaveState();
+});
+
+// Save state when memories are loaded
+const originalDisplayMemories = window.displayMemories;
+if (originalDisplayMemories) {
+    window.displayMemories = function(memories) {
+        originalDisplayMemories.apply(this, arguments);
+        scheduleSaveState();
+    };
+}
+
+// Monitor for session changes
+document.getElementById('session-selector')?.addEventListener('change', (e) => {
+    if (e.target.value === 'new') {
+        clearChatState();
+    } else {
+        scheduleSaveState();
+    }
+});
+
+// Initial state check on page load
+document.addEventListener('DOMContentLoaded', () => {
+    // Initialize session selector
+    loadSessions();
+
+    // Check if we have preserved state after a small delay to ensure tabManager is ready
+    setTimeout(() => {
+        if (window.tabManager && window.tabManager.chatState) {
+            updateStateIndicator(true);
+            // Trigger state restoration if needed
+            window.tabManager.checkAndRestoreState();
+        }
+
+        // Set custom inactivity timeout (30 minutes by default)
+        if (window.tabManager) {
+            // You can adjust this value as needed
+            window.tabManager.setInactivityTimeout(30);
+        }
+    }, 100);
+});
 </script>
 {% endblock %}

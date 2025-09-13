@@ -1,0 +1,164 @@
+/* Tab Manager Styles */
+
+/* Fade animations for tab transitions */
+main {
+    transition: opacity 0.2s ease;
+}
+
+/* State indicator animations */
+@keyframes pulse {
+    0%, 100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.5;
+    }
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Inactivity notification */
+.inactivity-notification {
+    animation: fadeIn 0.3s ease-in;
+}
+
+/* Loading state for tab content */
+.tab-loading {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+}
+
+.tab-loading::after {
+    content: '';
+    width: 40px;
+    height: 40px;
+    border: 3px solid var(--synth-border);
+    border-top-color: var(--synth-cyan);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* Tab state indicator styles */
+#chat-state-indicator {
+    animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateX(20px);
+    }
+    to {
+        opacity: 0.8;
+        transform: translateX(0);
+    }
+}
+
+#chat-state-indicator:hover {
+    opacity: 1 !important;
+    box-shadow: 0 0 15px rgba(0, 255, 255, 0.3);
+}
+
+/* Prevent navigation links from flashing during state preservation */
+nav a {
+    transition: all 0.3s ease;
+}
+
+nav a.state-preserved {
+    position: relative;
+}
+
+nav a.state-preserved::after {
+    content: '●';
+    position: absolute;
+    top: 50%;
+    right: -10px;
+    transform: translateY(-50%);
+    color: var(--synth-cyan);
+    font-size: 8px;
+    animation: pulse 2s infinite;
+}
+
+/* Memory panel preservation indicator */
+.memory-panel.state-preserved {
+    border-left: 2px solid var(--synth-cyan);
+}
+
+/* Session selector state indicator */
+.session-selector.has-state {
+    border-color: var(--synth-cyan);
+    box-shadow: 0 0 5px rgba(0, 255, 255, 0.2);
+}
+
+/* Clear button hover effect */
+#chat-state-indicator button:hover {
+    transform: scale(1.05);
+    box-shadow: 0 0 10px rgba(255, 16, 240, 0.4);
+}
+
+/* Loading overlay for tab switches */
+.tab-transition-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(5px);
+    display: none;
+    z-index: 9999;
+    align-items: center;
+    justify-content: center;
+}
+
+.tab-transition-overlay.active {
+    display: flex;
+}
+
+.tab-transition-message {
+    color: var(--synth-cyan);
+    font-family: 'Michroma', sans-serif;
+    font-size: 1rem;
+    text-align: center;
+    animation: pulse 1s infinite;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    #chat-state-indicator {
+        position: fixed;
+        bottom: 10px;
+        right: 10px;
+        z-index: 100;
+        flex-direction: column;
+        padding: 0.5rem;
+        font-size: 0.65rem;
+    }
+
+    #chat-state-indicator button {
+        margin-left: 0;
+        margin-top: 0.25rem;
+        width: 100%;
+    }
+}

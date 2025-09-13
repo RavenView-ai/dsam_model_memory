@@ -140,6 +140,56 @@ main {
     cursor: pointer;
 }
 
+.checkbox-cell {
+    width: 40px;
+    text-align: center;
+}
+
+.checkbox-cell input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+    accent-color: var(--synth-cyan);
+}
+
+.bulk-actions-bar {
+    display: none;
+    padding: 1rem;
+    background: linear-gradient(135deg, rgba(168, 85, 247, 0.2), rgba(0, 255, 255, 0.1));
+    border: 1px solid var(--synth-border);
+    border-radius: 5px;
+    margin-bottom: 1rem;
+    align-items: center;
+    justify-content: space-between;
+    animation: slideDown 0.3s ease-out;
+}
+
+@keyframes slideDown {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.bulk-actions-bar.active {
+    display: flex;
+}
+
+.selection-info {
+    color: var(--synth-cyan);
+    font-family: 'Michroma', sans-serif;
+    font-size: 0.9rem;
+}
+
+.bulk-action-buttons {
+    display: flex;
+    gap: 1rem;
+}
+
 .sort-header {
     cursor: pointer;
     user-select: none;
@@ -359,6 +409,55 @@ main {
   </div>
 </div>
 
+<!-- Bulk Actions Bar -->
+<div id="bulk-actions-bar" class="bulk-actions-bar">
+  <div class="selection-info">
+    <span id="selection-count">0</span> memories selected
+  </div>
+  <div class="bulk-action-buttons">
+    <button onclick="selectAllVisible()" class="btn-synthwave" style="
+      background: transparent;
+      border: 1px solid var(--synth-cyan);
+      color: var(--synth-cyan);
+      padding: 0.5rem 1rem;
+      border-radius: 5px;
+      cursor: pointer;
+      font-family: 'Michroma', sans-serif;
+      font-size: 0.8rem;
+      transition: all 0.3s ease;
+    ">
+      Select All Visible
+    </button>
+    <button onclick="clearSelection()" class="btn-synthwave" style="
+      background: transparent;
+      border: 1px solid var(--synth-purple);
+      color: var(--synth-purple);
+      padding: 0.5rem 1rem;
+      border-radius: 5px;
+      cursor: pointer;
+      font-family: 'Michroma', sans-serif;
+      font-size: 0.8rem;
+      transition: all 0.3s ease;
+    ">
+      Clear Selection
+    </button>
+    <button onclick="deleteSelectedMemories()" class="btn-synthwave" style="
+      background: linear-gradient(135deg, var(--synth-pink), rgba(255, 16, 240, 0.7));
+      border: none;
+      color: white;
+      padding: 0.5rem 1rem;
+      border-radius: 5px;
+      cursor: pointer;
+      font-family: 'Michroma', sans-serif;
+      font-size: 0.8rem;
+      transition: all 0.3s ease;
+      box-shadow: 0 2px 10px rgba(255, 16, 240, 0.3);
+    ">
+      Delete Selected
+    </button>
+  </div>
+</div>
+
 <!-- Filter Panel -->
 <div class="panel filter-panel">
   <h4 style="color: var(--synth-cyan); margin-bottom: 1rem;">Filters</h4>
@@ -439,6 +538,9 @@ main {
   <table class="memories-table">
     <thead>
       <tr>
+        <th class="checkbox-cell">
+          <input type="checkbox" id="select-all-memories" title="Select/Deselect all">
+        </th>
         <th class="sort-header" data-sort="when_ts">
           When
           {% if filters and filters.sort_by == 'when_ts' %}
@@ -479,7 +581,10 @@ main {
     </thead>
     <tbody>
       {% for r in rows %}
-        <tr class="memory-row" data-memory='{{ r | tojson }}' onclick="showMemoryDetails(this)" style="cursor: pointer;">
+        <tr class="memory-row" data-memory='{{ r | tojson }}' data-memory-id="{{ r['memory_id'] }}" onclick="showMemoryDetails(this)" style="cursor: pointer;">
+          <td class="checkbox-cell" onclick="event.stopPropagation();">
+            <input type="checkbox" class="memory-checkbox" value="{{ r['memory_id'] }}" onclick="event.stopPropagation(); toggleMemorySelection('{{ r['memory_id'] }}')">
+          </td>
           <td><code style="color: var(--synth-cyan); font-size: 0.8rem;">{{ r['when_ts'][:19] if r['when_ts'] else '-' }}</code></td>
           <td><span class="text-muted">{{ r['session_id'][:12] if r['session_id'] else '-' }}</span></td>
           <td>
@@ -612,7 +717,23 @@ main {
 {% endif %}
 
 <script>
+// Track selected memories
+let selectedMemories = new Set();
+
 document.addEventListener('DOMContentLoaded', function() {
+    // Select all checkbox handler
+    document.getElementById('select-all-memories').addEventListener('change', function() {
+        const checkboxes = document.querySelectorAll('.memory-checkbox');
+        checkboxes.forEach(cb => {
+            cb.checked = this.checked;
+            if (this.checked) {
+                selectedMemories.add(cb.value);
+            } else {
+                selectedMemories.delete(cb.value);
+            }
+        });
+        updateBulkActionsBar();
+    });
     
     // Delete All button
     document.getElementById('btn-delete-all').addEventListener('click', function() {
@@ -1130,6 +1251,147 @@ async function performImport() {
         importButton.disabled = false;
         importButton.textContent = 'Import Memories';
     }
+}
+
+// Toggle memory selection
+function toggleMemorySelection(memoryId) {
+    const checkbox = document.querySelector(`.memory-checkbox[value="${memoryId}"]`);
+    if (checkbox.checked) {
+        selectedMemories.add(memoryId);
+    } else {
+        selectedMemories.delete(memoryId);
+    }
+    updateBulkActionsBar();
+    updateSelectAllCheckbox();
+}
+
+// Update bulk actions bar visibility and count
+function updateBulkActionsBar() {
+    const bulkBar = document.getElementById('bulk-actions-bar');
+    const countSpan = document.getElementById('selection-count');
+
+    if (selectedMemories.size > 0) {
+        bulkBar.classList.add('active');
+        countSpan.textContent = selectedMemories.size;
+    } else {
+        bulkBar.classList.remove('active');
+    }
+}
+
+// Update select all checkbox state
+function updateSelectAllCheckbox() {
+    const selectAllCheckbox = document.getElementById('select-all-memories');
+    const allCheckboxes = document.querySelectorAll('.memory-checkbox');
+    const checkedCheckboxes = document.querySelectorAll('.memory-checkbox:checked');
+
+    if (allCheckboxes.length === 0) {
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = false;
+    } else if (checkedCheckboxes.length === 0) {
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = false;
+    } else if (checkedCheckboxes.length === allCheckboxes.length) {
+        selectAllCheckbox.checked = true;
+        selectAllCheckbox.indeterminate = false;
+    } else {
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = true;
+    }
+}
+
+// Select all visible memories
+function selectAllVisible() {
+    const checkboxes = document.querySelectorAll('.memory-checkbox');
+    checkboxes.forEach(cb => {
+        cb.checked = true;
+        selectedMemories.add(cb.value);
+    });
+    updateBulkActionsBar();
+    updateSelectAllCheckbox();
+}
+
+// Clear selection
+function clearSelection() {
+    const checkboxes = document.querySelectorAll('.memory-checkbox');
+    checkboxes.forEach(cb => {
+        cb.checked = false;
+    });
+    selectedMemories.clear();
+    updateBulkActionsBar();
+    updateSelectAllCheckbox();
+}
+
+// Delete selected memories with synthwave confirmation
+function deleteSelectedMemories() {
+    if (selectedMemories.size === 0) return;
+
+    const count = selectedMemories.size;
+    const memoryText = count === 1 ? 'memory' : 'memories';
+
+    synthModal.confirm({
+        title: `Delete ${count} ${memoryText}`,
+        message: `Are you sure you want to delete ${count} selected ${memoryText}?`,
+        submessage: `This will permanently remove ${count === 1 ? 'this memory' : 'these memories'} from the system.`,
+        type: count > 5 ? 'danger' : 'warning',
+        confirmText: `Delete ${count} ${memoryText}`,
+        cancelText: 'Cancel',
+        showWarningBox: true,
+        warningText: `THIS ACTION CANNOT BE UNDONE! ${count} ${memoryText} will be permanently deleted.`,
+        onConfirm: async () => {
+            try {
+                // Show loading state
+                const bulkBar = document.getElementById('bulk-actions-bar');
+                const originalContent = bulkBar.innerHTML;
+                bulkBar.innerHTML = '<div style="color: var(--synth-cyan); font-family: \'Michroma\', sans-serif;">Deleting memories... <span style="color: var(--synth-pink);">Please wait</span></div>';
+
+                // Delete memories one by one (could be optimized with a bulk endpoint)
+                const memoryIds = Array.from(selectedMemories);
+                let successCount = 0;
+                let failedCount = 0;
+
+                for (const memoryId of memoryIds) {
+                    try {
+                        const response = await fetch(`/api/memories/${memoryId}`, {
+                            method: 'DELETE'
+                        });
+                        const data = await response.json();
+                        if (data.success) {
+                            successCount++;
+                        } else {
+                            failedCount++;
+                        }
+                    } catch (error) {
+                        failedCount++;
+                    }
+                }
+
+                // Clear selection and reload
+                selectedMemories.clear();
+
+                if (failedCount > 0) {
+                    synthModal.alert({
+                        title: 'Partial Success',
+                        message: `Deleted ${successCount} memories. Failed to delete ${failedCount} memories.`,
+                        type: 'warning',
+                        onClose: () => location.reload()
+                    });
+                } else {
+                    synthModal.alert({
+                        title: 'Success',
+                        message: `Successfully deleted ${successCount} ${successCount === 1 ? 'memory' : 'memories'}`,
+                        type: 'success',
+                        onClose: () => location.reload()
+                    });
+                }
+            } catch (error) {
+                synthModal.alert({
+                    title: 'Error',
+                    message: 'Failed to delete memories: ' + error.message,
+                    type: 'danger'
+                });
+            }
+        }
+    });
 }
 </script>
 

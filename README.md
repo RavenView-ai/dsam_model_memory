@@ -45,11 +45,28 @@ python -m venv .venv
 # Linux/Mac
 source .venv/bin/activate
 
-# Install dependencies
+# Install dependencies (includes llama-cpp-python)
 pip install -r requirements.txt
 
 # Optional: Install document parsing dependencies
 pip install -r requirements-optional.txt
+```
+
+#### Note on llama-cpp-python
+
+JAM uses `llama-cpp-python` for local LLM inference. This package will be automatically installed with the requirements and provides:
+- Python bindings for llama.cpp
+- CPU inference by default (no GPU required)
+- Automatic model loading and management
+- Built-in embedding generation
+
+For GPU acceleration (optional):
+```bash
+# For CUDA support
+CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip install llama-cpp-python --force-reinstall --no-cache-dir
+
+# For Metal support (macOS)
+CMAKE_ARGS="-DLLAMA_METAL=on" pip install llama-cpp-python --force-reinstall --no-cache-dir
 ```
 
 ### Configuration

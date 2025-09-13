@@ -1,11 +1,11 @@
 {
   "weights": {
-    "semantic": 0.7699364449429155,
-    "recency": 0.014378972191067787,
-    "actor": 0.07189486095533892,
-    "temporal": 0.07189486095533892,
-    "spatial": 0.03594743047766946,
-    "usage": 0.03594743047766946
+    "semantic": 0.68,
+    "recency": 0.02,
+    "actor": 0.1,
+    "temporal": 0.1,
+    "spatial": 0.05,
+    "usage": 0.05
   },
   "analyzer": {
     "top_k": 100,
@@ -37,6 +37,6 @@
   },
   "_metadata": {
     "version": "1.0",
-    "last_modified": "2025-09-13T06:32:51.826938"
+    "last_modified": "2025-09-13T10:53:10.361611"
   }
 }
