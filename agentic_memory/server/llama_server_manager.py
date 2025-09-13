@@ -9,13 +9,113 @@ import signal
 import logging
 import requests
 import psutil
+import json
 from pathlib import Path
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List, Tuple
 from dataclasses import dataclass
 import atexit
 import platform
 
 logger = logging.getLogger(__name__)
+
+
+def parse_value(value: str) -> Union[str, int, float, bool, List[str]]:
+    """Parse environment variable value to appropriate type.
+
+    Handles:
+    - Booleans: true/false, yes/no, 1/0
+    - Numbers: integers and floats
+    - Lists: comma-separated values
+    - JSON: for complex structures
+    - Strings: everything else
+    """
+    # Handle None or empty
+    if not value:
+        return value
+
+    value = value.strip()
+
+    # Boolean values
+    if value.lower() in ('true', 'yes', '1', 'on', 'enabled'):
+        return True
+    if value.lower() in ('false', 'no', '0', 'off', 'disabled'):
+        return False
+
+    # Try JSON parsing for complex structures
+    if value.startswith('[') or value.startswith('{'):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
+
+    # Comma-separated list
+    if ',' in value:
+        return [v.strip() for v in value.split(',')]
+
+    # Try numeric parsing
+    try:
+        if '.' in value:
+            return float(value)
+        return int(value)
+    except ValueError:
+        pass
+
+    # Default to string
+    return value
+
+
+def parse_custom_flags_from_env(prefix: str) -> Dict[str, Any]:
+    """Parse custom llama.cpp flags from environment variables.
+
+    Args:
+        prefix: Environment variable prefix to look for (e.g., 'AM_LLAMA_FLAG_')
+
+    Returns:
+        Dictionary of flag names to values
+
+    Examples:
+        AM_LLAMA_FLAG_rope_scaling=yarn -> {'rope-scaling': 'yarn'}
+        AM_LLAMA_FLAG_metrics=true -> {'metrics': True}
+        AM_LLAMA_FLAG_cache_type_k=q8_0 -> {'cache-type-k': 'q8_0'}
+    """
+    custom_flags = {}
+
+    for key, value in os.environ.items():
+        if key.startswith(prefix):
+            # Extract flag name and convert underscores to hyphens
+            flag_name = key[len(prefix):].lower().replace('_', '-')
+            parsed_value = parse_value(value)
+            custom_flags[flag_name] = parsed_value
+            logger.debug(f"Parsed custom flag: {flag_name}={parsed_value} (type: {type(parsed_value).__name__})")
+
+    return custom_flags
+
+
+def build_flag_args(flag_name: str, value: Any) -> List[str]:
+    """Convert a flag name and value to command line arguments.
+
+    Args:
+        flag_name: The flag name (e.g., 'rope-scaling')
+        value: The flag value (bool, string, number, list)
+
+    Returns:
+        List of command line arguments
+    """
+    # Handle boolean flags
+    if isinstance(value, bool):
+        if value:
+            return [f"--{flag_name}"]
+        return []  # Don't add false boolean flags
+
+    # Handle list values (multiple arguments)
+    if isinstance(value, list):
+        args = []
+        for item in value:
+            args.extend([f"--{flag_name}", str(item)])
+        return args
+
+    # Handle single value flags
+    return [f"--{flag_name}", str(value)]
 
 
 @dataclass
@@ -24,7 +124,7 @@ class BaseLlamaServerConfig:
     # Server executable settings
     server_executable: Optional[str] = None
     server_path: Optional[str] = None
-    
+
     # Server settings
     host: str = "0.0.0.0"
     port: int = 8000
@@ -37,15 +137,23 @@ class BaseLlamaServerConfig:
     lock_memory: bool = True  # Lock model in memory
     batch_size: int = 20480
     ubatch_size: int = 1024
-    
+
     # Model settings (to be overridden)
     model_path: str = ""
     model_alias: str = ""
-    
+
     # Timeouts
     startup_timeout: int = 60
     shutdown_timeout: int = 10
     health_check_interval: float = 1.0
+
+    # Additional custom flags from environment
+    custom_flags: Dict[str, Any] = None
+
+    def __post_init__(self):
+        """Initialize custom flags dict if not provided."""
+        if self.custom_flags is None:
+            self.custom_flags = {}
 
 
 @dataclass
@@ -69,11 +177,11 @@ class LLMServerConfig(BaseLlamaServerConfig):
     def from_env(cls) -> 'LLMServerConfig':
         """Create config from environment variables."""
         config = cls()
-        
+
         # Model path
         if os.getenv("AM_MODEL_PATH") or os.getenv("LLM_MODEL_PATH"):
             config.model_path = os.getenv("AM_MODEL_PATH", os.getenv("LLM_MODEL_PATH"))
-        
+
         # Server settings
         if os.getenv("AM_LLAMA_PORT"):
             config.port = int(os.getenv("AM_LLAMA_PORT"))
@@ -106,7 +214,10 @@ class LLMServerConfig(BaseLlamaServerConfig):
             config.lock_memory = os.getenv("AM_MLOCK").lower() in ("true", "1", "yes")
         if os.getenv("AM_FLASH_ATTENTION"):
             config.flash_attention = os.getenv("AM_FLASH_ATTENTION").lower() in ("true", "1", "yes")
-            
+
+        # Parse custom flags from environment variables
+        config.custom_flags = parse_custom_flags_from_env("AM_LLAMA_FLAG_")
+
         return config
 
 
@@ -129,19 +240,22 @@ class EmbeddingServerConfig(BaseLlamaServerConfig):
     def from_env(cls) -> 'EmbeddingServerConfig':
         """Create config from environment variables."""
         config = cls()
-        
+
         # Model path
         if os.getenv("AM_EMBEDDING_MODEL_PATH"):
             config.model_path = os.getenv("AM_EMBEDDING_MODEL_PATH")
-        
+
         # Port (default to 8002 for embedding server)
         if os.getenv("AM_EMBEDDING_PORT"):
             config.port = int(os.getenv("AM_EMBEDDING_PORT"))
-            
+
         # Pooling type
         if os.getenv("AM_EMBEDDING_POOLING"):
             config.pooling_type = os.getenv("AM_EMBEDDING_POOLING")
-            
+
+        # Parse custom flags for embedding server
+        config.custom_flags = parse_custom_flags_from_env("AM_EMBEDDING_FLAG_")
+
         return config
 
 
@@ -209,23 +323,23 @@ class BaseLlamaServerManager:
             "-b", str(self._config.batch_size),
             "-ub", str(self._config.ubatch_size)
         ]
-        
+
         # Add GPU layers if specified
         if self._config.n_gpu_layers != 0:
             cmd.extend(["--n-gpu-layers", str(self._config.n_gpu_layers)])
-        
+
         # Add memory optimization flags
         if self._config.lock_memory:
             cmd.append("--mlock")
         if self._config.no_mmap:
             cmd.append("--no-mmap")
-        
+
         # Add embedding-specific settings
         if hasattr(self._config, 'embedding_enabled') and self._config.embedding_enabled:
             cmd.append("--embeddings")
             if hasattr(self._config, 'pooling_type'):
                 cmd.extend(["--pooling", self._config.pooling_type])
-        
+
         # Add LLM-specific settings
         if hasattr(self._config, 'continuous_batching') and self._config.continuous_batching:
             cmd.append("--cont-batching")
@@ -233,7 +347,15 @@ class BaseLlamaServerManager:
             cmd.extend(["--parallel", str(self._config.parallel_sequences)])
         if hasattr(self._config, 'flash_attention') and self._config.flash_attention:
             cmd.append("--flash-attn")
-        
+
+        # Add custom flags from environment variables
+        if hasattr(self._config, 'custom_flags') and self._config.custom_flags:
+            for flag_name, value in self._config.custom_flags.items():
+                flag_args = build_flag_args(flag_name, value)
+                cmd.extend(flag_args)
+                if flag_args:  # Only log if flag was actually added
+                    logger.debug(f"Added custom flag: {' '.join(flag_args)}")
+
         return cmd
     
     def _kill_existing_server(self) -> bool:
@@ -291,7 +413,11 @@ class BaseLlamaServerManager:
         
         # Build command
         cmd = self._build_command(server_path, model_path)
-        
+
+        # Log the command with custom flags info
+        if hasattr(self._config, 'custom_flags') and self._config.custom_flags:
+            logger.info(f"Starting {self.server_type} server with {len(self._config.custom_flags)} custom flags")
+            logger.debug(f"Custom flags: {self._config.custom_flags}")
         logger.info(f"Starting {self.server_type} server: {' '.join(cmd)}")
         
         try:
