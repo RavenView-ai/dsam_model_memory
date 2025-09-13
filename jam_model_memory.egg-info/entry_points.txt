@@ -1,3 +1,0 @@
-[console_scripts]
-jam = agentic_memory.cli:main
-jam-server = agentic_memory.server.flask_app:main

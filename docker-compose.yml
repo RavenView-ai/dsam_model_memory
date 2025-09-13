@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  agentic-memory:
+    build: .
+    container_name: agentic-memory
+    ports:
+      - "5001:5001"  # Web interface
+      - "8000:8000"  # LLM server
+      - "8001:8001"  # API server
+    volumes:
+      # Persist database and indexes
+      - ./data:/app/data
+      # Persist logs
+      - ./logs:/app/logs
+      # Mount .env file for configuration
+      - ./.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - AM_DB_PATH=/app/data/memories.db
+      - AM_INDEX_PATH=/app/data/faiss_index
+      - AM_LOG_DIR=/app/logs
+      # Model path - override default if needed via environment variable
+      - AM_MODEL_PATH=${AM_MODEL_PATH:-/app/models/default-model.gguf}
+    restart: unless-stopped
+    networks:
+      - agentic-network
+
+networks:
+  agentic-network:
+    driver: bridge
