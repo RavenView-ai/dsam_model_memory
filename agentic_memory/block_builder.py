@@ -54,25 +54,9 @@ class BlockBuilder:
             )
             blocks.append(blk)
 
-            # Persist block
-            self.store.create_block(
-                {
-                    'block_id': blk.block_id,
-                    'query_fingerprint': blk.query_fingerprint,
-                    'created_at': blk.created_at.isoformat(),
-                    'budget_tokens': blk.budget_tokens,
-                    'used_tokens': blk.used_tokens,
-                    'has_more': blk.has_more,
-                    'prev_block_id': blk.prev_block_id,
-                    'next_block_id': None,
-                    'summary_text': blk.summary_text
-                },
-                member_ids=picked_ids
-            )
-            if prev_block_id is not None:
-                # back-link previous block to this one
-                # (for simplicity, we won't update here; UI can resolve through store.get_block if needed)
-                pass
+            # Note: Block persistence removed (tables were dropped)
+            # Blocks are now only kept in memory for the session
+            # Previously: self.store.create_block()
             prev_block_id = blk.block_id
 
             # Remove picked from remaining

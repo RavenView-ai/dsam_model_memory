@@ -1,255 +1,329 @@
+"""
+Unified 5W1H extractor that handles both single and multi-part extraction.
+"""
 from __future__ import annotations
-from typing import Dict, Any, Optional, List
-from datetime import datetime
-import json
-import re
-from ..types import RawEvent, MemoryRecord, Who, Where
-from ..tokenization import TokenizerAdapter
-from ..config import cfg
-import numpy as np
+from typing import List, Optional, Dict, Any
+from ..types import RawEvent, MemoryRecord
+from .base_extractor import (
+    BaseExtractor,
+    FIELD_EXTRACTION_RULES,
+    BASE_SCHEMA,
+    MEMORY_RECALL_INSTRUCTIONS
+)
 
-# Use llama.cpp embeddings
-from ..embedding import get_llama_embedder
 
-# Initialize embedder once at module level to avoid reloading
-_embedder = None
-
-def _get_embedder():
-    global _embedder
-    if _embedder is None:
-        _embedder = get_llama_embedder()
-    return _embedder
-
-def _extract_entities_fallback(text: str) -> List[str]:
-    """Extract entities from text as a fallback when LLM fails.
-    
-    This is a simple rule-based extraction for common patterns.
-    """
-    entities = []
-    
-    # Clean the text
-    text = text.strip()
-    if not text:
-        return []
-    
-    # Extract capitalized words (likely proper nouns)
-    # But skip common words that are often capitalized
-    common_words = {'The', 'This', 'That', 'What', 'When', 'Where', 'Who', 'How', 'Why',
-                   'If', 'Then', 'And', 'But', 'Or', 'In', 'On', 'At', 'To', 'From',
-                   'Is', 'Are', 'Was', 'Were', 'Can', 'Could', 'Would', 'Should'}
-    
-    # Find sequences of capitalized words (e.g., "Growth Hormone")
-    cap_pattern = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b'
-    for match in re.finditer(cap_pattern, text):
-        entity = match.group()
-        if entity not in common_words and len(entity) > 2:
-            entities.append(entity)
-    
-    # Extract acronyms (e.g., GH, IGF-1, API)
-    acronym_pattern = r'\b[A-Z]{2,}(?:-\d+)?\b'
-    for match in re.finditer(acronym_pattern, text):
-        entities.append(match.group())
-    
-    # Extract technical terms with numbers (e.g., Python3, IPv4)
-    tech_pattern = r'\b[A-Za-z]+\d+[A-Za-z0-9]*\b'
-    for match in re.finditer(tech_pattern, text):
-        entities.append(match.group())
-    
-    # Extract quoted strings (often important terms)
-    quote_pattern = r'["\']([^"\']+)["\']'
-    for match in re.finditer(quote_pattern, text):
-        quoted = match.group(1)
-        if len(quoted) < 50:  # Don't include long quotes
-            entities.append(quoted)
-    
-    # Extract common technical/scientific terms
-    tech_keywords = ['gene', 'protein', 'enzyme', 'hormone', 'receptor', 'molecule',
-                     'Python', 'JavaScript', 'Docker', 'Redis', 'API', 'database',
-                     'script', 'function', 'class', 'method', 'variable',
-                     'player', 'team', 'trade', 'contract', 'game']
-    
-    text_lower = text.lower()
-    for keyword in tech_keywords:
-        if keyword.lower() in text_lower:
-            entities.append(keyword)
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_entities = []
-    for entity in entities:
-        if entity.lower() not in seen:
-            seen.add(entity.lower())
-            unique_entities.append(entity)
-    
-    return unique_entities[:20]  # Limit to 20 entities
-
-PROMPT = """You are a structured-information extractor that converts an interaction into 5W1H fields.
+# Single extraction prompt
+SINGLE_EXTRACTION_PROMPT = f"""You are a structured-information extractor that converts an interaction into 5W1H fields.
 Return ONLY valid JSON in the following schema:
 
-{{
-  "who": {{ "type": "<actor type e.g. user, llm, tool, system, team, group, organization>", "id": "<string identifier>", "label": "<optional descriptive label>" }},
-  "who_list": ["<person1>", "<person2>", "<organization>", ...],
-  "what": ["<entity1>", "<entity2>", ...],
-  "when": "<ISO 8601 timestamp>",
-  "when_list": ["<time_expression1>", "<date_reference>", "<temporal_phrase>", ...],
-  "where": {{ "type": "<context type e.g. physical, digital, financial, academic, conceptual, social>", "value": "<specific context like UI path, URL, file, location, or domain>" }},
-  "where_list": ["<location1>", "<place2>", "<context>", ...],
-  "why": "<best-effort intent or reason - IMPORTANT: if the user is asking to recall memories, searching for information, or asking 'what do you remember about X' or 'is there any memory about Y', set this to 'memory_recall: <topic>' where <topic> is what they're trying to recall>",
-  "how": "<method used, tool/procedure/parameters>"
-}}
+{BASE_SCHEMA}
 
 CRITICAL: All list fields (who_list, what, when_list, where_list) must be JSON arrays containing relevant items.
 
-Extract for WHO_LIST: People, organizations, teams, roles, departments mentioned
-- "The CEO told the marketing team" → ["CEO", "marketing team"]
-- "Alice and Bob from engineering" → ["Alice", "Bob", "engineering"]
-- "OpenAI's GPT-4" → ["OpenAI", "GPT-4"]
-
-Extract for WHAT: Key entities, concepts, and topics
-- Names of people, organizations, teams, products
-- Technical terms, genes, proteins, chemicals
-- Programming languages, frameworks, tools
-- Concepts, theories, methodologies
-- Specific objects, places, or things
-- Numbers, dates, measurements when significant
-
-Extract for WHEN_LIST: Time expressions and temporal references
-- "yesterday at 3pm during the meeting" → ["yesterday", "3pm", "during the meeting"]
-- "last week's sprint" → ["last week", "sprint"]
-- "Q3 2024 planning" → ["Q3 2024", "planning period"]
-
-Extract for WHERE_LIST: Locations, places, and contexts
-- "in the conference room at headquarters" → ["conference room", "headquarters"]
-- "on GitHub in the main repository" → ["GitHub", "main repository"]
-- "Seattle office's lab" → ["Seattle office", "lab"]
-
-Examples:
-- "asked which genes encode Growth hormone (GH) and insulin-like growth factor 1" → what: ["genes", "Growth hormone", "GH", "insulin-like growth factor 1", "IGF-1", "encoding"]
-- "Python script for data analysis" → what: ["Python", "script", "data analysis"]
-- "Player X was traded from Team A to Team B" → who_list: ["Player X"], what: ["trade", "sports transaction"], where_list: ["Team A", "Team B"]
+{FIELD_EXTRACTION_RULES}
 
 Consider the content and metadata; be concise but unambiguous.
-Special instructions for the 'why' field:
-- If user asks "do you remember...", "what do you know about...", "recall memories about...", "find memories of...", "is there any memory about...", set why to "memory_recall: <topic>"
-- If user asks "what did we discuss about...", "what was said about...", set why to "memory_recall: <topic>"
-- If user asks for past information, history, or previous discussions, set why to "memory_recall: <topic>"
+{MEMORY_RECALL_INSTRUCTIONS}
 """
 
-def _call_llm(prompt: str, content: str) -> Optional[Dict[str, Any]]:
-    # Local llama.cpp in OpenAI-compatible mode
-    import requests
-    url = f"{cfg.llm_base_url}/chat/completions"
-    headers = {"Content-Type": "application/json"}
-    body = {
-        "model": cfg.llm_model,
-        "messages": [
-            {"role": "system", "content": PROMPT},
-            {"role": "user", "content": content},
-        ],
-        "temperature": 0.1
-    }
-    try:
-        r = requests.post(url, headers=headers, json=body, timeout=30)
-        r.raise_for_status()
-        out = r.json()["choices"][0]["message"]["content"]
-        # Try to parse JSON
-        start = out.find('{')
-        end = out.rfind('}')
-        if start >= 0 and end > start:
-            obj = json.loads(out[start:end+1])
-            return obj
-    except Exception:
-        return None
-    return None
 
-def extract_5w1h(raw: RawEvent, context_hint: str = "") -> MemoryRecord:
-    # Try LLM-based extraction first; fall back to rules
-    content = f"EventType: {raw.event_type}\nActor: {raw.actor}\nTimestamp: {raw.timestamp.isoformat()}\nContent: {raw.content}\nMetadata: {raw.metadata}\nContext: {context_hint}"
-    parsed = _call_llm(PROMPT, content)
-    # Initialize list fields
-    who_list = None
-    when_list = None
-    where_list = None
-    
-    if not parsed:
-        # simple fallback with recall detection
-        who_type = 'tool' if raw.event_type in ('tool_call','tool_result') else ('user' if raw.event_type=='user_message' else ('llm' if raw.event_type=='llm_message' else 'system'))
-        who = Who(type=who_type, id=raw.actor, label=None)
-        
-        # Extract entities from content as fallback
-        what_entities = _extract_entities_fallback(raw.content)
-        what = json.dumps(what_entities) if what_entities else raw.content[:160]
-        
-        where = Where(type='digital', value=raw.metadata.get('location') or raw.metadata.get('tool_name') or 'local_ui')
-        
-        # Detect recall queries in fallback
-        content_lower = raw.content.lower()
-        recall_keywords = ['remember', 'recall', 'memory', 'memories', 'what do you know', 
-                          'what did we discuss', 'what was said', 'find information',
-                          'is there any memory', 'do you have any memory']
-        
-        why = raw.metadata.get('intent') or 'unspecified'
-        for keyword in recall_keywords:
-            if keyword in content_lower:
-                # Extract topic from the content
-                topic = raw.content[content_lower.index(keyword)+len(keyword):].strip()[:50]
-                why = f"memory_recall: {topic}"
-                break
-        
-        how = raw.metadata.get('method') or raw.metadata.get('tool_name') or 'message'
-    else:
-        who = Who(**parsed['who'])
-        
-        # Handle list fields
-        who_list_raw = parsed.get('who_list', [])
-        if isinstance(who_list_raw, list) and who_list_raw:
-            who_list = json.dumps(who_list_raw)
-        
-        # Handle 'what' as array of entities
-        what_raw = parsed.get('what', [])
-        if isinstance(what_raw, list):
-            # Convert list to JSON string for storage
-            what = json.dumps(what_raw) if what_raw else '[]'
+# Multi-part extraction prompt
+MULTI_PART_PROMPT = f"""You are a structured-information extractor that identifies DISTINCT pieces of information and converts EACH into separate 5W1H fields.
+
+IMPORTANT: Break down complex or multi-part information into SEPARATE, atomic memories.
+
+For example, if the input contains:
+- Multiple facts about different topics
+- A list of items or events
+- Multiple actions or outcomes
+- Different pieces of information about the same topic
+
+Create a SEPARATE memory for each distinct piece of information.
+
+Return a JSON array where each element follows this schema:
+{BASE_SCHEMA}
+
+{FIELD_EXTRACTION_RULES}
+
+Guidelines:
+1. Each memory should be self-contained and independently searchable
+2. Don't combine unrelated facts into one memory
+3. Break lists into individual items
+4. Separate different attributes of the same subject into different memories
+5. Keep each "what" field focused on a single fact or action
+
+{MEMORY_RECALL_INSTRUCTIONS}
+
+Return ONLY the JSON array, no other text.
+"""
+
+
+class UnifiedExtractor(BaseExtractor):
+    """Unified extractor that handles both single and multi-part extraction."""
+
+    def extract_memories(
+        self,
+        raw: RawEvent,
+        context_hint: str = "",
+        max_parts: Optional[int] = None
+    ) -> List[MemoryRecord]:
+        """
+        Extract one or more 5W1H memory records from a raw event.
+
+        Args:
+            raw: The raw event to process
+            context_hint: Additional context for extraction
+            max_parts: Maximum number of parts to extract (1 for single, None for auto)
+
+        Returns:
+            List of MemoryRecord objects
+        """
+        # Prepare content for LLM
+        content = self._prepare_content(raw, context_hint)
+
+        # Determine extraction mode
+        if max_parts == 1:
+            # Force single extraction
+            parsed_list = self._extract_single(content)
         else:
-            # Fallback if LLM returns string instead of array
-            what = str(what_raw).strip() or raw.content[:160]
-        
-        when_list_raw = parsed.get('when_list', [])
-        if isinstance(when_list_raw, list) and when_list_raw:
-            when_list = json.dumps(when_list_raw)
-        
-        w = parsed.get('where', {'type':'digital','value':'local_ui'})
-        where = Where(type=w.get('type','digital'), value=w.get('value','local_ui'))
-        
-        where_list_raw = parsed.get('where_list', [])
-        if isinstance(where_list_raw, list) and where_list_raw:
-            where_list = json.dumps(where_list_raw)
-        
-        why = parsed.get('why','unspecified')
-        how = parsed.get('how','message')
+            # Attempt multi-part extraction if content is complex
+            should_multi = self._should_use_multi_part(raw)
+            if should_multi:
+                parsed_list = self._extract_multi(content)
+            else:
+                parsed_list = self._extract_single(content)
 
-    embedder = _get_embedder()
-    embed_text = f"WHAT: {what}\nWHY: {why}\nHOW: {how}\nRAW: {raw.content}"
-    vec = embedder.encode([embed_text], normalize_embeddings=True)[0]
-    token_counter = TokenizerAdapter().count_tokens(embed_text)
+        # Fallback if extraction failed
+        if not parsed_list:
+            parsed_list = [self.create_fallback_parsed(raw)]
 
-    rec = MemoryRecord(
-        session_id=raw.session_id,
-        source_event_id=raw.event_id,
-        who=who,
-        who_list=who_list,
-        what=what,
-        when=raw.timestamp,
-        when_list=when_list,
-        where=where,
-        where_list=where_list,
-        why=why,
-        how=how,
-        raw_text=raw.content,
-        token_count=token_counter,
-        embed_text=embed_text,
-        embed_model=cfg.embed_model_name
-    )
-    # Return both record and vector as bytes from caller; to avoid tight coupling we return rec only
-    rec.extra['embed_vector_np'] = vec.astype('float32').tolist()
-    return rec
+        # Limit parts if specified
+        if max_parts and len(parsed_list) > max_parts:
+            parsed_list = parsed_list[:max_parts]
+
+        # Create embeddings and memory records
+        return self._create_memory_records(raw, parsed_list)
+
+    def extract_batch(
+        self,
+        raw_events: List[RawEvent],
+        context_hints: Optional[List[str]] = None,
+        max_parts_per_event: Optional[int] = None
+    ) -> List[List[MemoryRecord]]:
+        """
+        Batch extract memories from multiple events for better performance.
+
+        Args:
+            raw_events: List of raw events to process
+            context_hints: Optional list of context hints (one per event)
+            max_parts_per_event: Maximum parts per event
+
+        Returns:
+            List of memory lists (one list per raw event)
+        """
+        if not context_hints:
+            context_hints = [''] * len(raw_events)
+
+        # Collect all parsed data first
+        all_parsed_data = []
+        for raw, hint in zip(raw_events, context_hints):
+            content = self._prepare_content(raw, hint)
+
+            # Determine extraction mode
+            if max_parts_per_event == 1:
+                parsed_list = self._extract_single(content)
+            else:
+                should_multi = self._should_use_multi_part(raw)
+                if should_multi:
+                    parsed_list = self._extract_multi(content)
+                else:
+                    parsed_list = self._extract_single(content)
+
+            # Fallback if needed
+            if not parsed_list:
+                parsed_list = [self.create_fallback_parsed(raw)]
+
+            # Limit parts if specified
+            if max_parts_per_event and len(parsed_list) > max_parts_per_event:
+                parsed_list = parsed_list[:max_parts_per_event]
+
+            all_parsed_data.append((raw, parsed_list))
+
+        # Batch process embeddings for efficiency
+        return self._batch_create_memory_records(all_parsed_data)
+
+    def _prepare_content(self, raw: RawEvent, context_hint: str) -> str:
+        """Prepare content string for LLM extraction."""
+        return (
+            f"EventType: {raw.event_type}\n"
+            f"Actor: {raw.actor}\n"
+            f"Timestamp: {raw.timestamp.isoformat()}\n"
+            f"Content: {raw.content}\n"
+            f"Metadata: {raw.metadata}\n"
+            f"Context: {context_hint}"
+        )
+
+    def _should_use_multi_part(self, raw: RawEvent) -> bool:
+        """Determine if multi-part extraction should be used."""
+        from ..config import cfg
+        return (
+            cfg.use_multi_part_extraction and (
+                len(raw.content) > cfg.multi_part_threshold or
+                '\n\n' in raw.content or
+                raw.content.count('\n') > 3 or
+                raw.event_type in ['llm_message', 'tool_result']
+            )
+        )
+
+    def _extract_single(self, content: str) -> List[Dict[str, Any]]:
+        """Extract a single memory structure."""
+        result = self.call_llm(SINGLE_EXTRACTION_PROMPT, content, max_tokens=1024)
+        if result:
+            # Wrap single result in list for uniform processing
+            if isinstance(result, dict):
+                return [result]
+            elif isinstance(result, list):
+                return result[:1]  # Take only first if array returned
+        return []
+
+    def _extract_multi(self, content: str) -> List[Dict[str, Any]]:
+        """Extract multiple memory structures."""
+        result = self.call_llm(MULTI_PART_PROMPT, content, max_tokens=2048)
+        if result:
+            if isinstance(result, list):
+                return result
+            elif isinstance(result, dict):
+                return [result]  # Single result, wrap in list
+        return []
+
+    def _create_memory_records(
+        self,
+        raw: RawEvent,
+        parsed_list: List[Dict[str, Any]]
+    ) -> List[MemoryRecord]:
+        """Create memory records from parsed data."""
+        memories = []
+
+        # Prepare embedding texts
+        embed_texts = []
+        for idx, parsed in enumerate(parsed_list):
+            what = self.process_what_field(
+                parsed.get('what', []),
+                fallback=f"Part {idx+1} of {raw.content[:100]}"
+            )
+            why = parsed.get('why', 'unspecified')
+            how = parsed.get('how', 'message')
+
+            # Only include raw content in first part's embedding
+            raw_for_embed = raw.content if idx == 0 else ""
+            embed_text = self.create_embed_text(what, why, how, raw_for_embed)
+            embed_texts.append(embed_text)
+
+        # Batch create embeddings
+        embeddings = self.batch_create_embeddings(embed_texts)
+
+        # Create memory records
+        for idx, (parsed, embed_text, vec) in enumerate(zip(parsed_list, embed_texts, embeddings)):
+            try:
+                part_suffix = f"_part{idx}" if len(parsed_list) > 1 else ""
+                rec = self.create_memory_record(
+                    raw, parsed, vec, embed_text,
+                    part_suffix=part_suffix,
+                    part_index=idx if len(parsed_list) > 1 else None,
+                    total_parts=len(parsed_list) if len(parsed_list) > 1 else None
+                )
+                memories.append(rec)
+            except Exception as e:
+                print(f"Failed to create memory {idx}: {e}")
+                continue
+
+        return memories
+
+    def _batch_create_memory_records(
+        self,
+        all_parsed_data: List[tuple[RawEvent, List[Dict[str, Any]]]]
+    ) -> List[List[MemoryRecord]]:
+        """Batch create memory records for multiple events."""
+        # Collect all embed texts for batch processing
+        all_embed_texts = []
+        embed_text_mapping = []  # Track which texts belong to which event/memory
+
+        for event_idx, (raw, parsed_list) in enumerate(all_parsed_data):
+            for memory_idx, parsed in enumerate(parsed_list):
+                what = self.process_what_field(
+                    parsed.get('what', []),
+                    fallback=f"Part {memory_idx+1} of {raw.content[:100]}"
+                )
+                why = parsed.get('why', 'unspecified')
+                how = parsed.get('how', 'message')
+
+                # Only include raw content in first part's embedding
+                raw_for_embed = raw.content if memory_idx == 0 else ""
+                embed_text = self.create_embed_text(what, why, how, raw_for_embed)
+                all_embed_texts.append(embed_text)
+                embed_text_mapping.append((event_idx, memory_idx))
+
+        # Batch encode all embeddings at once
+        all_embeddings = self.batch_create_embeddings(all_embed_texts)
+
+        # Build memory records using batch embeddings
+        results = []
+        embedding_idx = 0
+        for event_idx, (raw, parsed_list) in enumerate(all_parsed_data):
+            memories = []
+            for memory_idx, parsed in enumerate(parsed_list):
+                try:
+                    # Get the corresponding embedding
+                    embed_text = all_embed_texts[embedding_idx]
+                    vec = all_embeddings[embedding_idx]
+                    embedding_idx += 1
+
+                    part_suffix = f"_part{memory_idx}" if len(parsed_list) > 1 else ""
+                    rec = self.create_memory_record(
+                        raw, parsed, vec, embed_text,
+                        part_suffix=part_suffix,
+                        part_index=memory_idx if len(parsed_list) > 1 else None,
+                        total_parts=len(parsed_list) if len(parsed_list) > 1 else None
+                    )
+                    rec.extra['batch_processed'] = True
+                    memories.append(rec)
+
+                except Exception as e:
+                    print(f"Failed to create memory for event {event_idx}, memory {memory_idx}: {e}")
+                    continue
+
+            results.append(memories)
+
+        return results
+
+
+# Convenience functions for backward compatibility
+def extract_5w1h(raw: RawEvent, context_hint: str = "") -> MemoryRecord:
+    """
+    Extract a single 5W1H memory record from a raw event.
+    Backward compatibility wrapper.
+    """
+    extractor = UnifiedExtractor()
+    memories = extractor.extract_memories(raw, context_hint, max_parts=1)
+    return memories[0] if memories else None
+
+
+def extract_multi_part_5w1h(raw: RawEvent, context_hint: str = "") -> List[MemoryRecord]:
+    """
+    Extract multiple 5W1H memory records from a raw event.
+    Backward compatibility wrapper.
+    """
+    extractor = UnifiedExtractor()
+    return extractor.extract_memories(raw, context_hint, max_parts=None)
+
+
+def extract_batch_5w1h(
+    raw_events: List[RawEvent],
+    context_hints: Optional[List[str]] = None
+) -> List[List[MemoryRecord]]:
+    """
+    Batch extract memories from multiple events.
+    Backward compatibility wrapper.
+    """
+    extractor = UnifiedExtractor()
+    return extractor.extract_batch(raw_events, context_hints)

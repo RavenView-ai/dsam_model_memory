@@ -12,8 +12,7 @@ _component_embedder = get_component_embedder()
 
 from .config import cfg
 from .types import RawEvent, RetrievalQuery
-from .extraction.llm_extractor import extract_5w1h
-from .extraction.multi_part_extractor import extract_multi_part_5w1h, extract_batch_5w1h
+from .extraction.llm_extractor import UnifiedExtractor
 from .storage.sql_store import MemoryStore
 from .storage.faiss_index import FaissIndex
 from .retrieval import HybridRetriever
@@ -44,6 +43,7 @@ class MemoryRouter:
         self.embedder = _embedder
         self.component_embedder = _component_embedder
         self.tok = TokenizerAdapter()
+        self.extractor = UnifiedExtractor()
         
         # Initialize dynamic components if enabled and available
         if cfg.use_attention_retrieval and HAS_ATTENTION:
@@ -67,144 +67,88 @@ class MemoryRouter:
     def ingest(self, raw_event: RawEvent, context_hint: str = "", use_multi_part: bool = True) -> str:
         """
         Ingest a raw event, optionally breaking it into multiple memories.
-        
+
         Args:
             raw_event: The raw event to process
             context_hint: Additional context for extraction
             use_multi_part: If True, attempt to break complex content into multiple memories
-            
+
         Returns:
             Comma-separated list of memory IDs created
         """
+        # Extract memories (single or multi based on content and settings)
+        max_parts = None if use_multi_part else 1
+        memories = self.extractor.extract_memories(raw_event, context_hint, max_parts)
+
         memory_ids = []
-        
-        # Decide whether to use multi-part extraction
-        should_use_multi = use_multi_part and cfg.use_multi_part_extraction and (
-            len(raw_event.content) > cfg.multi_part_threshold or  # Long content
-            '\n\n' in raw_event.content or  # Multi-paragraph content
-            raw_event.content.count('\n') > 3 or  # Multiple lines
-            raw_event.event_type in ['llm_message', 'tool_result']  # Often have complex responses
-        )
-        
-        if should_use_multi:
-            # Try multi-part extraction
-            memories = extract_multi_part_5w1h(raw_event, context_hint=context_hint)
-            
-            # Process each memory
-            for rec in memories:
-                vec = np.array(rec.extra.pop('embed_vector_np'), dtype='float32')
-                
-                # Apply adaptive embedding if enabled
-                if self.adaptive_embeddings:
-                    usage_stats = self.store.get_usage_stats([rec.memory_id])
-                    vec = self.adaptive_embeddings.encode_with_context(
-                        vec, 
-                        usage_stats.get(rec.memory_id, {}),
-                        None
-                    )
-                
-                # Persist
-                self.store.upsert_memory(rec, embedding=vec.tobytes(), dim=vec.shape[0])
-                # Add to FAISS (normalized already)
-                self.index.add(rec.memory_id, vec)
-                memory_ids.append(rec.memory_id)
-            
-            if memory_ids:
-                self.index.save()
-                return ','.join(memory_ids)
-        
-        # Fallback to single extraction
-        rec = extract_5w1h(raw_event, context_hint=context_hint)
-        vec = np.array(rec.extra.pop('embed_vector_np'), dtype='float32')
-        
-        # Apply adaptive embedding if enabled
-        if self.adaptive_embeddings:
-            usage_stats = self.store.get_usage_stats([rec.memory_id])
-            vec = self.adaptive_embeddings.encode_with_context(
-                vec,
-                usage_stats.get(rec.memory_id, {}),
-                None
-            )
-        
-        # Persist main memory
-        self.store.upsert_memory(rec, embedding=vec.tobytes(), dim=vec.shape[0])
-        # Add main embedding to FAISS (normalized already)
-        self.index.add(rec.memory_id, vec)
+        for rec in memories:
+            vec = np.array(rec.extra.pop('embed_vector_np'), dtype='float32')
 
-        # Generate and store component embeddings
-        memory_dict = rec.dict()
-        component_embeddings = self.component_embedder.embed_all_components(memory_dict)
+            # Apply adaptive embedding if enabled
+            vec = self._apply_adaptive_embedding(vec, rec.memory_id)
 
-        # Store component embeddings in FAISS with prefixed IDs
-        if component_embeddings.get('who') is not None:
-            self.index.add(f"who:{rec.memory_id}", component_embeddings['who'])
-        if component_embeddings.get('where') is not None:
-            self.index.add(f"where:{rec.memory_id}", component_embeddings['where'])
-        if component_embeddings.get('when') is not None:
-            self.index.add(f"when:{rec.memory_id}", component_embeddings['when'])
-        if component_embeddings.get('why') is not None:
-            self.index.add(f"why:{rec.memory_id}", component_embeddings['why'])
-        if component_embeddings.get('how') is not None:
-            self.index.add(f"how:{rec.memory_id}", component_embeddings['how'])
+            # Persist
+            self.store.upsert_memory(rec, embedding=vec.tobytes(), dim=vec.shape[0])
+            # Add to FAISS (normalized already)
+            self.index.add(rec.memory_id, vec)
 
-        self.index.save()
-        return rec.memory_id
+            # Generate and store component embeddings
+            self._store_component_embeddings(rec)
+
+            memory_ids.append(rec.memory_id)
+
+        if memory_ids:
+            self.index.save()
+
+        return ','.join(memory_ids) if memory_ids else ''
     
     def ingest_batch(self, raw_events: List[RawEvent], context_hints: Optional[List[str]] = None) -> List[str]:
         """
         Batch ingest multiple raw events for better performance.
-        
+
         Args:
             raw_events: List of raw events to process
             context_hints: Optional list of context hints (one per event)
-            
+
         Returns:
             List of comma-separated memory IDs created for each event
         """
-        if not context_hints:
-            context_hints = [''] * len(raw_events)
-        
         # Use batch extraction for efficiency
-        all_memories = extract_batch_5w1h(raw_events, context_hints)
-        
+        all_memories = self.extractor.extract_batch(raw_events, context_hints)
+
         result_ids = []
         all_vectors = []
         all_records = []
-        
+
         # Process all memories from all events
         for event_memories in all_memories:
             event_memory_ids = []
-            
+
             for rec in event_memories:
                 vec = np.array(rec.extra.pop('embed_vector_np'), dtype='float32')
-                
+
                 # Apply adaptive embedding if enabled
-                if self.adaptive_embeddings:
-                    usage_stats = self.store.get_usage_stats([rec.memory_id])
-                    vec = self.adaptive_embeddings.encode_with_context(
-                        vec,
-                        usage_stats.get(rec.memory_id, {}),
-                        None
-                    )
-                
+                vec = self._apply_adaptive_embedding(vec, rec.memory_id)
+
                 all_vectors.append(vec)
                 all_records.append(rec)
                 event_memory_ids.append(rec.memory_id)
-            
+
             result_ids.append(','.join(event_memory_ids) if event_memory_ids else '')
-        
+
         # Batch persist to database
         for rec, vec in zip(all_records, all_vectors):
             self.store.upsert_memory(rec, embedding=vec.tobytes(), dim=vec.shape[0])
-        
-        # Batch add to FAISS index
+
+        # Batch add to FAISS index with component embeddings
         for rec, vec in zip(all_records, all_vectors):
             self.index.add(rec.memory_id, vec)
-        
+            self._store_component_embeddings(rec)
+
         # Save index once after all additions
         if all_records:
             self.index.save()
-        
+
         return result_ids
 
     def retrieve_block(self, session_id: str, context_messages: List[Dict[str, str]],
@@ -277,21 +221,8 @@ class MemoryRouter:
         # Update embedding drift based on retrieval context
         if self.adaptive_embeddings and out.get('members'):
             member_ids = out['members'][:10]  # Top 10 members
-            embeddings = []
-            for mid in member_ids:
-                emb = self.store.get_embedding_drift(mid)
-                if emb is not None:
-                    embeddings.append(emb)
-            
-            # Update drift for each retrieved memory
-            for mid in member_ids:
-                if embeddings:
-                    self.adaptive_embeddings.update_embedding_drift(mid, embeddings)
-                    
-                    # Store updated drift
-                    if mid in self.adaptive_embeddings.embedding_momentum:
-                        drift = self.adaptive_embeddings.embedding_momentum[mid]
-                        self.store.store_embedding_drift(mid, drift)
+            # Note: Embedding drift tracking removed (table was dropped)
+            # Previously tracked embedding evolution for adaptive retrieval
         
         return out
     
@@ -410,3 +341,31 @@ class MemoryRouter:
             'tokens_used': tokens_used,
             'memories': memories
         }
+
+    def _apply_adaptive_embedding(self, vec: np.ndarray, memory_id: str) -> np.ndarray:
+        """Apply adaptive embedding transformation if enabled."""
+        if self.adaptive_embeddings:
+            usage_stats = self.store.get_usage_stats([memory_id])
+            return self.adaptive_embeddings.encode_with_context(
+                vec,
+                usage_stats.get(memory_id, {}),
+                None
+            )
+        return vec
+
+    def _store_component_embeddings(self, rec: MemoryRecord) -> None:
+        """Generate and store component embeddings for a memory record."""
+        memory_dict = rec.dict()
+        component_embeddings = self.component_embedder.embed_all_components(memory_dict)
+
+        # Store component embeddings in FAISS with prefixed IDs
+        if component_embeddings.get('who') is not None:
+            self.index.add(f"who:{rec.memory_id}", component_embeddings['who'])
+        if component_embeddings.get('where') is not None:
+            self.index.add(f"where:{rec.memory_id}", component_embeddings['where'])
+        if component_embeddings.get('when') is not None:
+            self.index.add(f"when:{rec.memory_id}", component_embeddings['when'])
+        if component_embeddings.get('why') is not None:
+            self.index.add(f"why:{rec.memory_id}", component_embeddings['why'])
+        if component_embeddings.get('how') is not None:
+            self.index.add(f"how:{rec.memory_id}", component_embeddings['how'])

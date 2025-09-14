@@ -17,8 +17,7 @@ import time
 import traceback
 
 from agentic_memory.config import Config
-from agentic_memory.extraction.llm_extractor import extract_5w1h
-from agentic_memory.extraction.multi_part_extractor import extract_multi_part_5w1h, extract_batch_5w1h
+from agentic_memory.extraction.llm_extractor import extract_5w1h, extract_multi_part_5w1h, extract_batch_5w1h
 from agentic_memory.types import RawEvent
 from agentic_memory.storage.sql_store import MemoryStore
 from agentic_memory.storage.faiss_index import FaissIndex

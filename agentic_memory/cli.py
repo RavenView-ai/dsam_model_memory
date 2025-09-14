@@ -9,12 +9,14 @@ import asyncio
 import logging
 import subprocess
 import signal
+import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 import click
 import psutil
 import time
+import numpy as np
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -394,8 +396,16 @@ def parse(file_path, strategy, chunk_size, overlap, dry_run):
     
     # Ingest into memory
     click.echo("\nIngesting chunks into memory...")
+    from agentic_memory.storage.sql_store import MemoryStore
+    from agentic_memory.storage.faiss_index import FaissIndex
+
     config = ConfigManager()
-    router = MemoryRouter(config)
+    db_path = config.get_value('db_path') or 'data/amemory.sqlite3'
+    index_path = config.get_value('index_path') or 'data/faiss.index'
+
+    store = MemoryStore(db_path)
+    index = FaissIndex(1024, index_path)  # Assuming 1024 dimensions
+    router = MemoryRouter(store, index)
     
     memories_created = 0
     with click.progressbar(parsed_doc.chunks) as chunks:
@@ -457,8 +467,16 @@ def batch(directory, recursive, extensions, strategy, chunk_size, overlap):
     
     # Ingest into memory
     if click.confirm("Ingest all documents into memory?"):
+        from agentic_memory.storage.sql_store import MemoryStore
+        from agentic_memory.storage.faiss_index import FaissIndex
+
         config = ConfigManager()
-        router = MemoryRouter(config)
+        db_path = config.get_value('db_path') or 'data/amemory.sqlite3'
+        index_path = config.get_value('index_path') or 'data/faiss.index'
+
+        store = MemoryStore(db_path)
+        index = FaissIndex(1024, index_path)  # Assuming 1024 dimensions
+        router = MemoryRouter(store, index)
         
         total_memories = 0
         for doc in parsed_docs:
@@ -528,8 +546,16 @@ def formats():
 @click.option('--actor', default='user', help='Actor/source of the memory')
 def add(text, actor):
     """Add a memory"""
+    from agentic_memory.storage.sql_store import MemoryStore
+    from agentic_memory.storage.faiss_index import FaissIndex
+
     config = ConfigManager()
-    router = MemoryRouter(config)
+    db_path = config.get_value('db_path') or 'data/amemory.sqlite3'
+    index_path = config.get_value('index_path') or 'data/faiss.index'
+
+    store = MemoryStore(db_path)
+    index = FaissIndex(1024, index_path)  # Assuming 1024 dimensions
+    router = MemoryRouter(store, index)
     
     result = router.ingest(text, metadata={'actor': actor})
     if result:
@@ -544,8 +570,16 @@ def add(text, actor):
 @click.option('--format', 'output_format', type=click.Choice(['json', 'text']), default='text')
 def search(query, limit, output_format):
     """Search memories"""
+    from agentic_memory.storage.sql_store import MemoryStore
+    from agentic_memory.storage.faiss_index import FaissIndex
+
     config = ConfigManager()
-    router = MemoryRouter(config)
+    db_path = config.get_value('db_path') or 'data/amemory.sqlite3'
+    index_path = config.get_value('index_path') or 'data/faiss.index'
+
+    store = MemoryStore(db_path)
+    index = FaissIndex(1024, index_path)  # Assuming 1024 dimensions
+    router = MemoryRouter(store, index)
     
     results = router.retrieve(query, limit=limit)
     
@@ -562,20 +596,462 @@ def search(query, limit, output_format):
 
 
 @memory.command()
+@click.option('--batch-size', default=10, help='Batch size for processing')
+@click.option('--dry-run', is_flag=True, help='Show what would be fixed without making changes')
+def fix_embeddings(batch_size, dry_run):
+    """Regenerate missing or zero-norm embeddings"""
+    from agentic_memory.storage.sql_store import MemoryStore
+    from agentic_memory.embedding import get_llama_embedder
+    from agentic_memory.server.llama_server_manager import get_embedding_manager
+    import numpy as np
+
+    config = ConfigManager()
+    db_path = config.get_value('db_path') or 'data/amemory.sqlite3'
+
+    click.echo("Checking for missing or broken embeddings...")
+    click.echo("-" * 40)
+
+    store = MemoryStore(db_path)
+
+    # Find embeddings with zero norm
+    with store.connect() as con:
+        # Get all embeddings - check each one for zero norm
+        cursor = con.execute("""
+            SELECT e.memory_id, e.vector, m.raw_text
+            FROM embeddings e
+            LEFT JOIN memories m ON e.memory_id = m.memory_id
+            WHERE e.vector IS NOT NULL
+        """)
+
+        zero_norm_ids = []
+        missing_text_ids = []
+        total_checked = 0
+
+        while True:
+            batch = cursor.fetchmany(500)
+            if not batch:
+                break
+
+            for row in batch:
+                total_checked += 1
+                memory_id = row['memory_id']
+                vector_data = row['vector']
+                raw_text = row['raw_text']
+
+                if vector_data:
+                    vector = np.frombuffer(vector_data, dtype=np.float32)
+                    norm = np.linalg.norm(vector)
+                    if norm < 0.001:  # Near-zero norm
+                        zero_norm_ids.append((memory_id, raw_text))
+
+                if not raw_text:
+                    missing_text_ids.append(memory_id)
+
+        # Also find memories without any embeddings
+        cursor = con.execute("""
+            SELECT m.memory_id, m.raw_text
+            FROM memories m
+            LEFT JOIN embeddings e ON m.memory_id = e.memory_id
+            WHERE e.memory_id IS NULL AND m.raw_text IS NOT NULL
+        """)
+        missing_embeddings = cursor.fetchall()
+
+    click.echo(f"Checked {total_checked} embeddings")
+    click.echo(f"Found {len(zero_norm_ids)} zero-norm embeddings")
+    click.echo(f"Found {len(missing_embeddings)} memories without embeddings")
+    click.echo(f"Found {len(missing_text_ids)} embeddings without source text")
+
+    if not zero_norm_ids and not missing_embeddings:
+        click.echo("\nNo broken embeddings found!")
+        return
+
+    if dry_run:
+        click.echo("\n--dry-run specified, showing what would be fixed:")
+
+        if zero_norm_ids[:10]:
+            click.echo("\nZero-norm embeddings to regenerate:")
+            for memory_id, text in zero_norm_ids[:10]:
+                if text:
+                    preview = text[:100] + "..." if len(text) > 100 else text
+                else:
+                    preview = "[No source text]"
+                click.echo(f"  {memory_id}: {preview}")
+            if len(zero_norm_ids) > 10:
+                click.echo(f"  ... and {len(zero_norm_ids) - 10} more")
+
+        if missing_embeddings[:10]:
+            click.echo("\nMissing embeddings to generate:")
+            for row in missing_embeddings[:10]:
+                text = row['raw_text']
+                preview = text[:100] + "..." if len(text) > 100 else text
+                click.echo(f"  {row['memory_id']}: {preview}")
+            if len(missing_embeddings) > 10:
+                click.echo(f"  ... and {len(missing_embeddings) - 10} more")
+
+        return
+
+    # Start embedding server if needed
+    click.echo("\nEnsuring embedding server is running...")
+    emb_manager = get_embedding_manager()
+    if not emb_manager.ensure_running():
+        click.echo("Failed to start embedding server")
+        return
+
+    # Wait for server to be ready
+    import time
+    time.sleep(2)
+
+    # Initialize embedder
+    embedder = get_llama_embedder()
+
+    # Process zero-norm embeddings
+    if zero_norm_ids:
+        click.echo(f"\nRegenerating {len(zero_norm_ids)} zero-norm embeddings...")
+        fixed = 0
+        failed = 0
+
+        with click.progressbar(zero_norm_ids, label='Fixing zero-norm') as items:
+            for memory_id, text in items:
+                if not text:
+                    failed += 1
+                    continue
+
+                try:
+                    # Generate new embedding
+                    embedding = embedder.encode(text, normalize_embeddings=True)
+                    if embedding is not None and len(embedding) > 0:
+                        # Update in database
+                        embedding_bytes = embedding.astype(np.float32).tobytes()
+                        with store.connect() as con:
+                            con.execute(
+                                "UPDATE embeddings SET vector = ? WHERE memory_id = ?",
+                                (embedding_bytes, memory_id)
+                            )
+                        fixed += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    click.echo(f"\nError fixing {memory_id}: {e}")
+                    failed += 1
+
+        click.echo(f"Fixed {fixed} zero-norm embeddings, {failed} failed")
+
+    # Process missing embeddings
+    if missing_embeddings:
+        click.echo(f"\nGenerating {len(missing_embeddings)} missing embeddings...")
+        created = 0
+        failed = 0
+
+        with click.progressbar(missing_embeddings, label='Creating embeddings') as items:
+            for row in items:
+                memory_id = row['memory_id']
+                text = row['raw_text']
+
+                if not text:
+                    failed += 1
+                    continue
+
+                try:
+                    # Generate embedding
+                    embedding = embedder.encode(text, normalize_embeddings=True)
+                    if embedding is not None and len(embedding) > 0:
+                        # Insert into database
+                        embedding_bytes = embedding.astype(np.float32).tobytes()
+                        dim = len(embedding)
+
+                        with store.connect() as con:
+                            con.execute(
+                                """INSERT INTO embeddings (memory_id, vector, dimension)
+                                   VALUES (?, ?, ?)""",
+                                (memory_id, embedding_bytes, dim)
+                            )
+                        created += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    click.echo(f"\nError creating embedding for {memory_id}: {e}")
+                    failed += 1
+
+        click.echo(f"Created {created} new embeddings, {failed} failed")
+
+    # Summary
+    click.echo("\n" + "=" * 40)
+    click.echo("SUMMARY")
+    click.echo("=" * 40)
+    click.echo(f"Zero-norm fixed: {fixed if zero_norm_ids else 0}")
+    click.echo(f"Missing created: {created if missing_embeddings else 0}")
+    click.echo(f"Total failures: {failed if 'failed' in locals() else 0}")
+
+    if (zero_norm_ids or missing_embeddings) and not dry_run:
+        click.echo("\nRun 'memory rebuild-index' to update the FAISS index with the new embeddings")
+
+
+@memory.command()
 def stats():
     """Show memory statistics"""
+    from agentic_memory.storage.sql_store import MemoryStore
+    from agentic_memory.storage.faiss_index import FaissIndex
+
     config = ConfigManager()
-    router = MemoryRouter(config)
-    
-    stats = router.get_stats()
-    
+    db_path = config.get_value('db_path') or 'data/amemory.sqlite3'
+    index_path = config.get_value('index_path') or 'data/faiss.index'
+
+    store = MemoryStore(db_path)
+    index = FaissIndex(1024, index_path)  # Assuming 1024 dimensions
+
+    # Get statistics directly from store and index
+    import os
+
+    with store.connect() as con:
+        cursor = con.cursor()
+
+        # Total memories
+        cursor.execute("SELECT COUNT(*) FROM memories")
+        total_memories = cursor.fetchone()[0]
+
+        # Date range
+        cursor.execute("SELECT MIN(created_at), MAX(created_at) FROM memories")
+        date_range = cursor.fetchone()
+
+        # Unique actors (from memories table)
+        cursor.execute("SELECT COUNT(DISTINCT who_label) FROM memories")
+        unique_actors = cursor.fetchone()[0]
+
+    # File sizes
+    db_size_mb = os.path.getsize(db_path) / (1024 * 1024) if os.path.exists(db_path) else 0
+    index_size_mb = os.path.getsize(index_path) / (1024 * 1024) if os.path.exists(index_path) else 0
+
     click.echo("\nMemory Statistics:")
     click.echo("-" * 40)
-    click.echo(f"Total memories: {stats.get('total_memories', 0)}")
-    click.echo(f"Unique actors: {stats.get('unique_actors', 0)}")
-    click.echo(f"Date range: {stats.get('date_range', 'N/A')}")
-    click.echo(f"Database size: {stats.get('db_size_mb', 0):.2f} MB")
-    click.echo(f"Index size: {stats.get('index_size_mb', 0):.2f} MB")
+    click.echo(f"Total memories: {total_memories:,}")
+    click.echo(f"Unique actors: {unique_actors:,}")
+    click.echo(f"Date range: {date_range[0]} to {date_range[1]}")
+    click.echo(f"Database size: {db_size_mb:.2f} MB")
+    click.echo(f"Index size: {index_size_mb:.2f} MB")
+    click.echo(f"Index vectors: {index.index.ntotal:,}")
+
+
+@memory.command()
+@click.option('--backup/--no-backup', default=True, help='Backup existing index before rebuilding')
+@click.option('--batch-size', default=500, help='Batch size for processing embeddings')
+@click.option('--verify', is_flag=True, help='Verify index after rebuilding')
+@click.option('--verbose', is_flag=True, help='Show detailed information about skipped records')
+def rebuild_index(backup, batch_size, verify, verbose):
+    """Rebuild FAISS index from SQLite embeddings"""
+    from agentic_memory.storage.sql_store import MemoryStore
+    from agentic_memory.storage.faiss_index import FaissIndex
+    from datetime import datetime
+    import shutil
+
+    config = ConfigManager()
+
+    click.echo("Starting FAISS index rebuild...")
+    click.echo("-" * 40)
+
+    # Paths
+    db_path = config.get_value('db_path') or 'data/amemory.sqlite3'
+    index_path = config.get_value('index_path') or 'data/faiss.index'
+
+    # Backup existing index if requested
+    if backup and os.path.exists(index_path):
+        backup_path = f"{index_path}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        click.echo(f"Backing up existing index to: {backup_path}")
+        shutil.copy2(index_path, backup_path)
+
+        # Also backup the map file if it exists
+        if os.path.exists(f"{index_path}.map"):
+            shutil.copy2(f"{index_path}.map", f"{backup_path}.map")
+
+    # Initialize stores
+    click.echo("Loading embeddings from SQLite...")
+    store = MemoryStore(db_path)
+
+    # Get embedding dimension from first embedding
+    sample_embedding = store.get_sample_embedding()
+    if sample_embedding is None:
+        click.echo("Error: No embeddings found in SQLite database")
+        return
+
+    embedding_dim = len(sample_embedding)
+    click.echo(f"Embedding dimension: {embedding_dim}")
+
+    # Create new index
+    click.echo("Creating new FAISS index...")
+
+    # Remove old index files
+    if os.path.exists(index_path):
+        os.remove(index_path)
+    if os.path.exists(f"{index_path}.map"):
+        os.remove(f"{index_path}.map")
+
+    # Create new index
+    new_index = FaissIndex(embedding_dim, index_path)
+
+    # Get all embeddings from SQLite
+    click.echo("Fetching embeddings from database...")
+    embeddings_data = store.get_all_embeddings_for_rebuild(batch_size=batch_size)
+
+    total_embeddings = len(embeddings_data)
+    click.echo(f"Found {total_embeddings:,} embeddings to process")
+
+    # Track statistics
+    processed = 0
+    skipped = 0
+    duplicates_removed = 0
+    seen_hashes = {}  # Map hash to first memory_id that used it
+
+    # Track details for verbose mode
+    duplicate_groups = {}  # hash -> list of memory_ids
+    zero_norm_ids = []
+    error_ids = []
+
+    # Process embeddings with progress bar
+    with click.progressbar(embeddings_data, label='Rebuilding index', show_pos=verbose) as embeddings:
+        for memory_id, embedding_data in embeddings:
+            try:
+                # Convert embedding to numpy array
+                if isinstance(embedding_data, bytes):
+                    embedding = np.frombuffer(embedding_data, dtype=np.float32)
+                else:
+                    embedding = np.array(embedding_data, dtype=np.float32)
+
+                # Normalize the embedding first (before hashing for consistency)
+                norm = np.linalg.norm(embedding)
+                if norm > 0:
+                    embedding = embedding / norm
+                else:
+                    skipped += 1
+                    zero_norm_ids.append(memory_id)
+                    continue
+
+                # Check for duplicates (using a hash of the normalized embedding)
+                embedding_hash = hash(embedding.tobytes())
+                if embedding_hash in seen_hashes:
+                    # This is a duplicate - skip it but record it
+                    duplicates_removed += 1
+                    if embedding_hash not in duplicate_groups:
+                        duplicate_groups[embedding_hash] = [seen_hashes[embedding_hash]]
+                    duplicate_groups[embedding_hash].append(memory_id)
+                    continue
+
+                # First time seeing this embedding - keep it
+                seen_hashes[embedding_hash] = memory_id
+
+                # Add to index
+                new_index.add(memory_id, embedding)
+                processed += 1
+
+            except Exception as e:
+                if verbose:
+                    click.echo(f"\nError processing embedding for {memory_id}: {e}")
+                error_ids.append((memory_id, str(e)))
+                skipped += 1
+
+    # Save the new index
+    click.echo("\nSaving index...")
+    new_index.save()
+
+    # Display statistics
+    click.echo("\nRebuild complete!")
+    click.echo("-" * 40)
+    click.echo(f"Total embeddings in SQLite: {total_embeddings:,}")
+    click.echo(f"Successfully indexed: {processed:,}")
+    click.echo(f"Duplicates removed: {duplicates_removed:,}")
+    click.echo(f"Skipped (errors/zero vectors): {skipped:,}")
+    click.echo(f"  - Zero norm vectors: {len(zero_norm_ids):,}")
+    click.echo(f"  - Processing errors: {len(error_ids):,}")
+    click.echo(f"Final index size: {new_index.index.ntotal:,} vectors")
+
+    # Show verbose details if requested
+    if verbose:
+        click.echo("\n" + "=" * 60)
+        click.echo("DETAILED ANALYSIS")
+        click.echo("=" * 60)
+
+        # Show duplicate groups
+        if duplicate_groups:
+            click.echo(f"\nDuplicate Groups ({len(duplicate_groups)} unique embeddings with duplicates):")
+            # Sort by number of duplicates
+            sorted_groups = sorted(duplicate_groups.items(), key=lambda x: len(x[1]), reverse=True)
+            for i, (emb_hash, memory_ids) in enumerate(sorted_groups[:10], 1):
+                click.echo(f"\n  Group {i}: {len(memory_ids)} identical embeddings")
+                click.echo(f"    Kept: {memory_ids[0]}")
+                skipped_str = ', '.join(memory_ids[1:5])
+                if len(memory_ids) > 5:
+                    skipped_str += f" ... and {len(memory_ids)-5} more"
+                click.echo(f"    Skipped: {skipped_str}")
+
+            if len(duplicate_groups) > 10:
+                click.echo(f"\n  ... and {len(duplicate_groups)-10} more duplicate groups")
+
+        # Show zero norm vectors
+        if zero_norm_ids:
+            click.echo(f"\nZero Norm Vectors ({len(zero_norm_ids)} total):")
+            for i, memory_id in enumerate(zero_norm_ids[:10], 1):
+                click.echo(f"  {i}. {memory_id}")
+            if len(zero_norm_ids) > 10:
+                click.echo(f"  ... and {len(zero_norm_ids)-10} more")
+
+        # Show processing errors
+        if error_ids:
+            click.echo(f"\nProcessing Errors ({len(error_ids)} total):")
+            for i, (memory_id, error) in enumerate(error_ids[:10], 1):
+                click.echo(f"  {i}. {memory_id}: {error}")
+            if len(error_ids) > 10:
+                click.echo(f"  ... and {len(error_ids)-10} more")
+
+        # Summary stats
+        click.echo(f"\n" + "=" * 60)
+        click.echo("SUMMARY")
+        click.echo("=" * 60)
+        click.echo(f"Unique embeddings: {len(seen_hashes):,}")
+        click.echo(f"Duplicate groups: {len(duplicate_groups):,}")
+        if duplicate_groups:
+            max_dups = max(len(ids) for ids in duplicate_groups.values())
+            click.echo(f"Largest duplicate group: {max_dups} identical embeddings")
+
+    # Verify if requested
+    if verify:
+        click.echo("\nVerifying index...")
+
+        # Sample some embeddings and search for them
+        sample_size = min(10, processed)
+
+        verification_passed = 0
+        tests_performed = 0
+
+        # Get random memory IDs to test
+        for test_id in store.get_random_memory_ids(sample_size * 2):  # Get extra in case some are duplicates
+            if tests_performed >= sample_size:
+                break
+
+            test_embedding = store.get_embedding_by_memory_id(test_id)
+            if test_embedding:
+                test_vec = np.frombuffer(test_embedding, dtype=np.float32)
+                norm = np.linalg.norm(test_vec)
+                if norm > 0:
+                    test_vec = test_vec / norm
+
+                    # Check if this exact vector should be in the index
+                    # (it might have been deduplicated under a different memory_id)
+                    embedding_hash = hash(test_vec.tobytes())
+
+                    results = new_index.search(test_vec, 1)
+                    if results and len(results) > 0 and results[0][1] > 0.99:  # High similarity threshold
+                        verification_passed += 1
+
+                    tests_performed += 1
+
+        click.echo(f"Verification: {verification_passed}/{tests_performed} test queries successful")
+
+    # Calculate space saved
+    old_size = os.path.getsize(backup_path) if backup and os.path.exists(backup_path) else 0
+    new_size = os.path.getsize(index_path)
+
+    if old_size > 0:
+        space_saved = (old_size - new_size) / (1024 * 1024)  # MB
+        reduction_pct = (1 - new_size/old_size) * 100
+        click.echo(f"\nSpace saved: {space_saved:.1f} MB ({reduction_pct:.1f}% reduction)")
 
 
 @cli.group()

@@ -31,8 +31,7 @@ from .storage.sql_store import MemoryStore
 from .storage.faiss_index import FaissIndex
 
 # Extraction components
-from .extraction.llm_extractor import extract_5w1h
-from .extraction.multi_part_extractor import extract_multi_part_5w1h, extract_batch_5w1h
+from .extraction.llm_extractor import extract_5w1h, extract_multi_part_5w1h, extract_batch_5w1h
 
 # Advanced features (optional imports)
 try:

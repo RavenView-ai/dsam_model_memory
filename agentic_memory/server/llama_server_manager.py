@@ -15,6 +15,10 @@ from typing import Optional, Dict, Any, Union, List, Tuple
 from dataclasses import dataclass
 import atexit
 import platform
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +195,9 @@ class LLMServerConfig(BaseLlamaServerConfig):
             config.n_gpu_layers = int(os.getenv("AM_GPU_LAYERS"))
         if os.getenv("AM_THREADS"):
             config.threads = int(os.getenv("AM_THREADS"))
+            logger.debug(f"Setting threads from AM_THREADS: {config.threads}")
+        else:
+            logger.debug(f"AM_THREADS not set, using default: {config.threads}")
 
         # Batch processing settings
         if os.getenv("AM_BATCH_SIZE"):
@@ -253,6 +260,11 @@ class EmbeddingServerConfig(BaseLlamaServerConfig):
         if os.getenv("AM_EMBEDDING_POOLING"):
             config.pooling_type = os.getenv("AM_EMBEDDING_POOLING")
 
+        # Thread configuration (use same AM_THREADS as LLM server)
+        if os.getenv("AM_THREADS"):
+            config.threads = int(os.getenv("AM_THREADS"))
+            logger.debug(f"Setting embedding server threads from AM_THREADS: {config.threads}")
+
         # Parse custom flags for embedding server
         config.custom_flags = parse_custom_flags_from_env("AM_EMBEDDING_FLAG_")
 
@@ -312,6 +324,7 @@ class BaseLlamaServerManager:
     
     def _build_command(self, server_path: Path, model_path: Path) -> list:
         """Build the server command with all parameters."""
+        logger.info(f"Building command with {self._config.threads} threads")
         cmd = [
             str(server_path),
             "-m", str(model_path),
