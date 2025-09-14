@@ -34,9 +34,16 @@ from .storage.faiss_index import FaissIndex
 from .extraction.llm_extractor import extract_5w1h
 from .extraction.multi_part_extractor import extract_multi_part_5w1h, extract_batch_5w1h
 
-# Advanced features
-from .attention import AdaptiveEmbeddingSpace
-from .cluster.concept_cluster import LiquidMemoryClusters
+# Advanced features (optional imports)
+try:
+    from .attention import AdaptiveEmbeddingSpace
+except ImportError:
+    AdaptiveEmbeddingSpace = None
+
+try:
+    from .cluster.concept_cluster import LiquidMemoryClusters
+except ImportError:
+    LiquidMemoryClusters = None
 
 # Server components (optional imports)
 try:

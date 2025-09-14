@@ -6,7 +6,9 @@ import numpy as np
 
 # Use llama.cpp embeddings
 from .embedding import get_llama_embedder
+from .embedding.component_embedder import get_component_embedder
 _embedder = get_llama_embedder()
+_component_embedder = get_component_embedder()
 
 from .config import cfg
 from .types import RawEvent, RetrievalQuery
@@ -40,6 +42,7 @@ class MemoryRouter:
         self.builder = BlockBuilder(store)
         # Use global llama.cpp embedder
         self.embedder = _embedder
+        self.component_embedder = _component_embedder
         self.tok = TokenizerAdapter()
         
         # Initialize dynamic components if enabled and available
@@ -123,10 +126,27 @@ class MemoryRouter:
                 None
             )
         
-        # Persist
+        # Persist main memory
         self.store.upsert_memory(rec, embedding=vec.tobytes(), dim=vec.shape[0])
-        # Add to FAISS (normalized already)
+        # Add main embedding to FAISS (normalized already)
         self.index.add(rec.memory_id, vec)
+
+        # Generate and store component embeddings
+        memory_dict = rec.dict()
+        component_embeddings = self.component_embedder.embed_all_components(memory_dict)
+
+        # Store component embeddings in FAISS with prefixed IDs
+        if component_embeddings.get('who') is not None:
+            self.index.add(f"who:{rec.memory_id}", component_embeddings['who'])
+        if component_embeddings.get('where') is not None:
+            self.index.add(f"where:{rec.memory_id}", component_embeddings['where'])
+        if component_embeddings.get('when') is not None:
+            self.index.add(f"when:{rec.memory_id}", component_embeddings['when'])
+        if component_embeddings.get('why') is not None:
+            self.index.add(f"why:{rec.memory_id}", component_embeddings['why'])
+        if component_embeddings.get('how') is not None:
+            self.index.add(f"how:{rec.memory_id}", component_embeddings['how'])
+
         self.index.save()
         return rec.memory_id
     

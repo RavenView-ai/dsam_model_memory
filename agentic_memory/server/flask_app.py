@@ -939,13 +939,37 @@ def network_analytics(component):
             row_dict = dict(row)
             items = []
             data = row_dict[column]
-            
+
             if component in ['who', 'when', 'where'] and data:
                 # Parse JSON list for list columns
                 try:
-                    items = json.loads(data) if isinstance(data, str) else []
+                    parsed_data = json.loads(data) if isinstance(data, str) else []
+                    # Filter out empty items
+                    items = [item for item in parsed_data if item and item != 'unknown']
                 except:
                     items = []
+
+                # If who_list is empty but who_id exists, use that as fallback
+                if component == 'who' and not items:
+                    # Try to get who_id as fallback
+                    who_id_query = "SELECT who_id, who_label FROM memories WHERE memory_id = ?"
+                    who_row = con.execute(who_id_query, (row_dict['memory_id'],)).fetchone()
+                    if who_row:
+                        who_dict = dict(who_row)
+                        if who_dict.get('who_label'):
+                            items = [who_dict['who_label']]
+                        elif who_dict.get('who_id'):
+                            items = [who_dict['who_id']]
+
+                # If where_list is empty but where_value exists, use that
+                if component == 'where' and not items:
+                    where_query = "SELECT where_value FROM memories WHERE memory_id = ?"
+                    where_row = con.execute(where_query, (row_dict['memory_id'],)).fetchone()
+                    if where_row:
+                        where_dict = dict(where_row)
+                        if where_dict.get('where_value') and where_dict['where_value'] != 'unknown':
+                            items = [where_dict['where_value']]
+
             elif component == 'what' and data:
                 # Use existing entity extraction for what
                 items = retriever.extract_entities_from_what(data)

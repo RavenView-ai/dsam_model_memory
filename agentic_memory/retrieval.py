@@ -8,6 +8,8 @@ from .config import cfg
 from .storage.sql_store import MemoryStore
 from .storage.faiss_index import FaissIndex
 from .types import RetrievalQuery, Candidate
+from .embedding.component_embedder import get_component_embedder
+from .embedding.llama_embedder import get_llama_embedder
 # Attention mechanisms removed - using fixed weight comprehensive scoring only
 
 def exp_recency(ts_iso: str, now: datetime, half_life_hours: float = 72.0) -> float:
@@ -28,7 +30,9 @@ class HybridRetriever:
     def __init__(self, store: MemoryStore, index: FaissIndex):
         self.store = store
         self.index = index
-        
+        self.component_embedder = get_component_embedder()
+        self.embedder = get_llama_embedder()
+
         # No attention mechanisms - using comprehensive scoring with fixed weights
 
     def _semantic(self, qvec: np.ndarray, topk: int) -> List[Tuple[str, float]]:
@@ -55,40 +59,77 @@ class HybridRetriever:
 
     # Lexical search removed - FTS5 was broken and not needed with good semantic search
     
-    def _actor_based(self, actor_id: str, topk: int) -> List[Tuple[str, float]]:
-        """Retrieve memories from specific actor with recency-based scoring."""
-        rows = self.store.get_by_actor(actor_id, limit=topk)
-        if not rows:
+    def _actor_based(self, actor_hint: str, topk: int) -> List[Tuple[str, float]]:
+        """Retrieve memories from specific actor using semantic similarity.
+
+        This now uses embeddings to find semantically similar actors,
+        not just exact matches.
+        """
+        # Generate embedding for the actor hint
+        actor_embedding = self.component_embedder.embed_who(actor_hint)
+        if actor_embedding is None:
             return []
-        
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        results = []
-        for row in rows:
-            # Score based on recency - more recent memories get higher scores
-            # Use first timestamp from when_list if available
-            when_list = json.loads(row.get('when_list', '[]')) if row.get('when_list') else []
-            when_ts = when_list[0] if when_list else row.get('when_list', '[]')
-            recency_score = exp_recency(when_ts, now, half_life_hours=168.0)  # 1 week half-life
-            results.append((row['memory_id'], recency_score))
+
+        # Search for similar actor embeddings in FAISS
+        # We store component embeddings with prefixed IDs
+        # Limit to reasonable number to avoid performance issues
+        search_limit = min(topk * 2, 100)  # Cap at 100 for performance
+        results = self.index.search(actor_embedding, search_limit)
+
+        # Filter to only 'who:' prefixed entries and extract memory IDs
+        memory_scores = {}
+        for item_id, score in results:
+            if item_id.startswith('who:'):
+                memory_id = item_id[4:]  # Remove 'who:' prefix
+                # Normalize score to [0, 1]
+                norm_score = (score + 1.0) / 2.0
+                memory_scores[memory_id] = max(0.0, min(1.0, norm_score))
+
+        # If no semantic matches found, fall back to exact match
+        if not memory_scores:
+            rows = self.store.get_by_actor(actor_hint, limit=topk)
+            if rows:
+                for row in rows:
+                    memory_scores[row['memory_id']] = 0.5  # Medium confidence for exact match
+
+        # Convert to list format
+        results = list(memory_scores.items())[:topk]
         return results
     
     def _where_based(self, where_value: str, topk: int) -> List[Tuple[str, float]]:
-        """Retrieve memories from specific WHERE location with recency-based scoring.
-        
-        This searches the where_value field in the 5W1H model.
+        """Retrieve memories from specific WHERE location using semantic similarity.
+
+        This now uses embeddings to find semantically similar locations,
+        not just exact matches.
         """
-        rows = self.store.get_by_location(where_value, limit=topk)
-        if not rows:
+        # Generate embedding for the location hint
+        where_embedding = self.component_embedder.embed_where(where_value)
+        if where_embedding is None:
             return []
-        
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        results = []
-        for row in rows:
-            # Use first timestamp from when_list if available
-            when_list = json.loads(row.get('when_list', '[]')) if row.get('when_list') else []
-            when_ts = when_list[0] if when_list else row.get('when_list', '[]')
-            recency_score = exp_recency(when_ts, now, half_life_hours=168.0)
-            results.append((row['memory_id'], recency_score))
+
+        # Search for similar location embeddings in FAISS
+        # Limit to reasonable number to avoid performance issues
+        search_limit = min(topk * 2, 100)  # Cap at 100 for performance
+        results = self.index.search(where_embedding, search_limit)
+
+        # Filter to only 'where:' prefixed entries and extract memory IDs
+        memory_scores = {}
+        for item_id, score in results:
+            if item_id.startswith('where:'):
+                memory_id = item_id[6:]  # Remove 'where:' prefix
+                # Normalize score to [0, 1]
+                norm_score = (score + 1.0) / 2.0
+                memory_scores[memory_id] = max(0.0, min(1.0, norm_score))
+
+        # If no semantic matches found, fall back to exact match
+        if not memory_scores:
+            rows = self.store.get_by_location(where_value, limit=topk)
+            if rows:
+                for row in rows:
+                    memory_scores[row['memory_id']] = 0.5  # Medium confidence for exact match
+
+        # Convert to list format
+        results = list(memory_scores.items())[:topk]
         return results
     
     def _temporal_based(self, temporal_hint: Union[str, Tuple[str, str], Dict], topk: int) -> List[Tuple[str, float]]:
@@ -142,14 +183,15 @@ class HybridRetriever:
         
         return results
 
-    def compute_all_scores(self, 
+    def compute_all_scores(self,
                            memory_ids: List[str],
                            query_vec: np.ndarray,
                            query: RetrievalQuery,
                            sem_scores: Dict[str, float],
                            lex_scores: Dict[str, float],
                            actor_matches: Dict[str, float],
-                           temporal_matches: Dict[str, float]) -> List[Candidate]:
+                           temporal_matches: Dict[str, float],
+                           spatial_matches: Optional[Dict[str, float]] = None) -> List[Candidate]:
         """Compute comprehensive scores for all candidates across all dimensions."""
         
         # Fetch metadata for all candidates
@@ -187,23 +229,34 @@ class HybridRetriever:
             base_recency = exp_recency(when_ts, now, half_life_hours=168.0)
             recency_score = self._apply_smart_recency(memory_id, base_recency, memory_groups)
             
-            # 4. Actor match (binary or from hint)
+            # 4. Actor match (semantic similarity or from matches)
             actor_score = actor_matches.get(memory_id, 0.0)
             if not actor_score and query.actor_hint:
-                # Check if memory actor matches query hint
-                who_list = json.loads(memory.get('who_list', '[]'))
-                first_who = who_list[0] if who_list else ''
-                actor_score = 1.0 if first_who == query.actor_hint else 0.0
+                # Generate semantic similarity score on the fly if needed
+                # This is a fallback - ideally should be in actor_matches already
+                who_data = self._extract_who_for_memory(memory)
+                if who_data:
+                    actor_hint_emb = self.component_embedder.embed_who(query.actor_hint)
+                    who_emb = self.component_embedder.embed_who(who_data)
+                    if actor_hint_emb is not None and who_emb is not None:
+                        # Compute cosine similarity
+                        similarity = np.dot(actor_hint_emb, who_emb)
+                        # Already normalized, similarity is in [-1, 1]
+                        actor_score = max(0.0, (similarity + 1.0) / 2.0)
             
             # 5. Temporal match (binary or from hint)
             temporal_score = temporal_matches.get(memory_id, 0.0)
             
-            # 6. Spatial/location match (check if location mentioned in query)
+            # 6. Spatial/location match (semantic similarity)
             spatial_score = 0.0
-            if 'where_value' in memory.keys() and memory['where_value']:
-                # Simple check if location is mentioned in query
-                if memory['where_value'].lower() in query.text.lower():
-                    spatial_score = 1.0
+            if spatial_matches and memory_id in spatial_matches:
+                spatial_score = spatial_matches[memory_id]
+            else:
+                where_value = memory.get('where_value')
+                if where_value and where_value != 'unknown':
+                    # Fallback: Check if location mentioned in query
+                    if where_value.lower() in query.text.lower():
+                        spatial_score = 0.7  # Good match but not semantic
             
             # Get usage data
             usage_data = usage_stats.get(memory_id, {})
@@ -502,31 +555,46 @@ class HybridRetriever:
         cands.sort(key=lambda x: x.score, reverse=True)
         return cands
 
-    def search(self, rq: RetrievalQuery, qvec: np.ndarray, topk_sem: int = 50, topk_lex: int = 50) -> List[Candidate]:
+    def search(self, rq: RetrievalQuery, qvec: np.ndarray, topk_sem: int = 50, topk_lex: int = 50, enable_component_search: bool = True) -> List[Candidate]:
         # REDESIGNED: Retrieve large candidate set and score comprehensively
         # The topk parameters now only control the FINAL output size, not initial retrieval
 
         # Step 1: Get large candidate sets from each source (cast wide net)
         # Use topk_sem for retrieval size (will be 999999 from analyzer)
         initial_retrieval_size = topk_sem
-        
+
+        # Auto-extract actor hint from query if not provided
+        if enable_component_search and not rq.actor_hint:
+            rq.actor_hint = self._extract_actor_from_query(rq.text)
+
         # Get semantic candidates (vector similarity)
         sem = self._semantic(qvec, initial_retrieval_size)
         sem_dict = {mid: score for mid, score in sem}
-        
+
         # Lexical search removed - using semantic only
         lex_dict = {}  # Empty dict for backward compatibility
-        
-        # Get actor-specific candidates if hint provided
+
+        # Get actor-specific candidates if hint provided or extracted
         actor_candidates = []
-        if rq.actor_hint:
-            actor_candidates = self._actor_based(rq.actor_hint, 500)
-        actor_dict = {mid: 1.0 for mid, _ in actor_candidates}  # Binary match
+        if enable_component_search and rq.actor_hint:
+            # Limit actor search for performance
+            actor_candidates = self._actor_based(rq.actor_hint, min(50, topk_sem // 10))
+        actor_dict = {mid: score for mid, score in actor_candidates}  # Now using similarity scores
         
-        # Get temporal candidates if hint provided  
+        # Get location-specific candidates if location detected in query
+        spatial_candidates = []
+        if enable_component_search:
+            location_hint = self._extract_location_from_query(rq.text)
+            if location_hint:
+                # Limit location search for performance
+                spatial_candidates = self._where_based(location_hint, min(50, topk_sem // 10))
+        self._spatial_matches = {mid: score for mid, score in spatial_candidates}
+
+        # Get temporal candidates if hint provided
         temporal_candidates = []
-        if rq.temporal_hint:
-            temporal_candidates = self._temporal_based(rq.temporal_hint, 500)
+        if enable_component_search and rq.temporal_hint:
+            # Limit temporal search for performance
+            temporal_candidates = self._temporal_based(rq.temporal_hint, min(50, topk_sem // 10))
         temporal_dict = {mid: 1.0 for mid, _ in temporal_candidates}  # Binary match
         
         # Step 2: Combine all unique memory IDs
@@ -535,6 +603,8 @@ class HybridRetriever:
         all_memory_ids.update(lex_dict.keys())
         all_memory_ids.update(actor_dict.keys())
         all_memory_ids.update(temporal_dict.keys())
+        if hasattr(self, '_spatial_matches'):
+            all_memory_ids.update(self._spatial_matches.keys())
         
         # Step 3: Compute comprehensive scores for all candidates
         candidates = self.compute_all_scores(
@@ -544,7 +614,8 @@ class HybridRetriever:
             sem_scores=sem_dict,
             lex_scores=lex_dict,
             actor_matches=actor_dict,
-            temporal_matches=temporal_dict
+            temporal_matches=temporal_dict,
+            spatial_matches=getattr(self, '_spatial_matches', {})
         )
         
         # Step 4: Apply final top-K selection
@@ -752,12 +823,15 @@ class HybridRetriever:
         # Normalize weights
         weights = self.update_weights(weights)
 
-        # Temporarily override the fixed weights in compute_all_scores
-        # We'll need to modify compute_all_scores to accept weights parameter
-        # For now, use standard search and re-score
+        # Check if component searches are needed based on weights
+        enable_components = (weights.get('actor', 0) > 0.01 or
+                            weights.get('spatial', 0) > 0.01 or
+                            weights.get('temporal', 0) > 0.01)
+
+        # Use standard search with component control
         # topk_lex is ignored now since lexical search is removed
-        # Use topk_sem for the search (should be large like 10000 for analyzer)
-        candidates = self.search(rq, qvec, topk_sem=topk_sem, topk_lex=0)
+        candidates = self.search(rq, qvec, topk_sem=topk_sem, topk_lex=0,
+                               enable_component_search=enable_components)
 
         # Re-score with custom weights
         for c in candidates:
@@ -773,3 +847,97 @@ class HybridRetriever:
         # Re-sort and return all candidates (let knapsack algorithm handle selection)
         candidates.sort(key=lambda x: x.score, reverse=True)
         return candidates
+
+    def _extract_who_for_memory(self, memory: Dict) -> Optional[Union[str, List, Dict]]:
+        """Extract WHO data from a memory record."""
+        # Try who_list first
+        who_list = memory.get('who_list')
+        if who_list:
+            try:
+                parsed = json.loads(who_list) if isinstance(who_list, str) else who_list
+                if parsed:
+                    return parsed
+            except:
+                pass
+
+        # Try structured who fields
+        if memory.get('who_label'):
+            return {
+                'id': memory.get('who_id'),
+                'label': memory.get('who_label'),
+                'type': memory.get('who_type')
+            }
+
+        # Fall back to who_id
+        if memory.get('who_id'):
+            return memory['who_id']
+
+        return None
+
+    def _extract_location_from_query(self, query_text: str) -> Optional[str]:
+        """Extract potential location references from query text.
+
+        This is a simple heuristic approach. Could be enhanced with NER.
+        """
+        # Common location indicators
+        location_patterns = [
+            r'\b(?:in|at|from|to|near|around|within|outside)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:office|building|room|city|country|state)',
+            r'\b(?:location|place|venue|site)\s*[:"]\s*([^"]+)',
+        ]
+
+        for pattern in location_patterns:
+            match = re.search(pattern, query_text)
+            if match:
+                location = match.group(1).strip()
+                # Filter out common false positives
+                if location and location.lower() not in ['the', 'this', 'that', 'what', 'when', 'where']:
+                    return location
+
+        # Look for known location keywords in the query
+        words = query_text.split()
+        for i, word in enumerate(words):
+            # Check if word looks like a place name (capitalized)
+            if word[0].isupper() and len(word) > 2:
+                # Check context - is it preceded by location prepositions?
+                if i > 0 and words[i-1].lower() in ['in', 'at', 'from', 'to', 'near']:
+                    return word
+
+        return None
+
+    def _extract_actor_from_query(self, query_text: str) -> Optional[str]:
+        """Extract potential actor/person references from query text.
+
+        This is a simple heuristic approach. Could be enhanced with NER.
+        """
+        # Common patterns for identifying actors/people
+        actor_patterns = [
+            # Direct person references with possessive or action
+            r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)(?:'s|\s+(?:said|asked|mentioned|discussed|talked|wrote|did|was|is))\b",
+            # Questions about specific people
+            r"\b(?:what|when|where|how|why)\s+(?:did|does|was|is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b",
+            # Prepositions indicating people
+            r"\b(?:by|from|with|to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b",
+            # Direct "about X" pattern
+            r"\babout\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b",
+            # Role-based references
+            r"\b(?:the\s+)?(user|assistant|system|admin|developer|manager|team lead)\b",
+        ]
+
+        for pattern in actor_patterns:
+            match = re.search(pattern, query_text, re.IGNORECASE)
+            if match:
+                actor = match.group(1).strip()
+                # Filter out common false positives
+                if actor and actor.lower() not in ['the', 'this', 'that', 'what', 'when', 'where', 'how', 'why']:
+                    # Check if it looks like a person name (capitalized words)
+                    if actor[0].isupper() or actor.lower() in ['user', 'assistant', 'system', 'admin']:
+                        return actor
+
+        # Look for pronouns that might indicate user/assistant
+        if any(word in query_text.lower() for word in ['i ', "i've", "i'm", 'my ', 'me ']):
+            return 'user'
+        if any(word in query_text.lower() for word in ['you ', "you've", "you're", 'your ']):
+            return 'assistant'
+
+        return None
