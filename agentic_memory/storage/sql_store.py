@@ -53,6 +53,19 @@ CREATE TABLE IF NOT EXISTS usage_stats (
     last_access TEXT
 );
 
+CREATE TABLE IF NOT EXISTS component_embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id TEXT NOT NULL REFERENCES memories(memory_id) ON DELETE CASCADE,
+    component_type TEXT NOT NULL,  -- 'who', 'where', 'what'
+    component_value TEXT NOT NULL,  -- the actual entity text
+    embedding BLOB NOT NULL,
+    dim INTEGER NOT NULL,
+    UNIQUE(memory_id, component_type, component_value)
+);
+
+CREATE INDEX IF NOT EXISTS idx_component_embeddings_memory_id ON component_embeddings(memory_id);
+CREATE INDEX IF NOT EXISTS idx_component_embeddings_type ON component_embeddings(component_type);
+
 -- Note: Advanced features (clustering, blocks, synapses, importance, drift) have been
 -- removed as they were never implemented and had no data. If these features are needed
 -- in the future, they can be re-added with proper implementation.
@@ -297,3 +310,49 @@ class MemoryStore:
         if row and row['vector']:
             return row['vector']
         return None
+
+    def store_component_embedding(self, memory_id: str, component_type: str,
+                                 component_value: str, embedding: bytes, dim: int):
+        """Store a component embedding for a memory"""
+        with self.connect() as con:
+            con.execute(
+                """INSERT OR REPLACE INTO component_embeddings
+                (memory_id, component_type, component_value, embedding, dim)
+                VALUES (?, ?, ?, ?, ?)""",
+                (memory_id, component_type, component_value, embedding, dim)
+            )
+
+    def get_component_embeddings(self, memory_id: str) -> List[Dict[str, Any]]:
+        """Get all component embeddings for a memory"""
+        with self.connect() as con:
+            rows = con.execute(
+                """SELECT component_type, component_value, embedding, dim
+                FROM component_embeddings WHERE memory_id = ?""",
+                (memory_id,)
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def search_by_component(self, component_type: str, query_embedding: bytes,
+                           limit: int = 10) -> List[Tuple[str, float]]:
+        """Search memories by component embedding similarity
+        Returns list of (memory_id, similarity_score) tuples"""
+        results = []
+        query_vec = np.frombuffer(query_embedding, dtype='float32')
+
+        with self.connect() as con:
+            rows = con.execute(
+                """SELECT DISTINCT memory_id, embedding
+                FROM component_embeddings
+                WHERE component_type = ?""",
+                (component_type,)
+            ).fetchall()
+
+        for row in rows:
+            component_vec = np.frombuffer(row['embedding'], dtype='float32')
+            similarity = np.dot(query_vec, component_vec)
+            results.append((row['memory_id'], float(similarity)))
+
+        # Sort by similarity and return top N
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:limit]

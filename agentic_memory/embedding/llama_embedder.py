@@ -27,45 +27,51 @@ class LlamaEmbedder:
         return self._dimension
     
     def encode(
-        self, 
-        texts: Union[str, List[str]], 
+        self,
+        texts: Union[str, List[str]],
         batch_size: int = 32,
         normalize_embeddings: bool = None,
-        show_progress_bar: bool = False
+        show_progress_bar: bool = False,
+        instruction: Optional[str] = None
     ) -> np.ndarray:
         """
         Encode texts to embeddings using llama.cpp server.
-        
+
         Args:
             texts: Single text or list of texts to encode
             batch_size: Batch size for processing
             normalize_embeddings: Whether to normalize (defaults to self.normalize)
             show_progress_bar: Ignored for compatibility
-            
+            instruction: Optional instruction prefix for Qwen3-Embedding
+
         Returns:
             Numpy array of embeddings
         """
         if isinstance(texts, str):
             texts = [texts]
-        
+
         if normalize_embeddings is None:
             normalize_embeddings = self.normalize
-            
+
+        # Apply instruction prefix if provided (Qwen3-Embedding feature)
+        if instruction:
+            texts = [f"Instruct: {instruction}\nQuery: {text}" for text in texts]
+
         embeddings = []
-        
+
         # Process in batches for efficiency
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i+batch_size]
             batch_embeddings = self._get_embeddings_batch(batch)
             embeddings.extend(batch_embeddings)
-        
+
         embeddings = np.array(embeddings, dtype='float32')
-        
+
         # Normalize if requested
         if normalize_embeddings:
             norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
             embeddings = embeddings / (norms + 1e-8)
-        
+
         return embeddings
     
     def _get_embeddings_batch(self, texts: List[str]) -> List[np.ndarray]:
@@ -124,4 +130,3 @@ def get_llama_embedder() -> LlamaEmbedder:
     if _llama_embedder is None:
         _llama_embedder = LlamaEmbedder()
     return _llama_embedder
-

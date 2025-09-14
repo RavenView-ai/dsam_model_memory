@@ -7,8 +7,10 @@ import numpy as np
 # Use llama.cpp embeddings
 from .embedding import get_llama_embedder
 from .embedding.component_embedder import get_component_embedder
+from .embedding.instruction_generator import get_instruction_generator
 _embedder = get_llama_embedder()
 _component_embedder = get_component_embedder()
+_instruction_generator = get_instruction_generator()
 
 from .config import cfg
 from .types import RawEvent, RetrievalQuery
@@ -166,12 +168,25 @@ class MemoryRouter:
                 ctx_text = cleaned_text  # Use cleaned text for better semantic search
         
         rq = RetrievalQuery(
-            session_id=session_id, 
-            actor_hint=actor_hint, 
+            session_id=session_id,
+            actor_hint=actor_hint,
             temporal_hint=temporal_hint,
             text=ctx_text
         )
-        qvec = self.embedder.encode([ctx_text], normalize_embeddings=True)[0]
+
+        # Generate instruction based on default weights
+        weights = {
+            'semantic': cfg.w_semantic,
+            'recency': cfg.w_recency,
+            'actor': cfg.w_actor,
+            'spatial': cfg.w_spatial,
+            'temporal': cfg.w_temporal,
+            'usage': cfg.w_usage
+        }
+        instruction = _instruction_generator.generate_instruction(weights)
+
+        # Encode with instruction prefix for better retrieval
+        qvec = self.embedder.encode([ctx_text], normalize_embeddings=True, instruction=instruction)[0]
         
         # Apply adaptive query embedding if enabled
         if self.adaptive_embeddings:
@@ -269,9 +284,12 @@ class MemoryRouter:
             temporal_hint=decomposition.get('when')
         )
         
-        # Get query embedding
-        qvec = self.embedder.encode([query], normalize_embeddings=True)[0]
-        
+        # Generate instruction based on provided weights
+        instruction = _instruction_generator.generate_instruction(weights)
+
+        # Get query embedding with instruction prefix
+        qvec = self.embedder.encode([query], normalize_embeddings=True, instruction=instruction)[0]
+
         # Apply adaptive embedding if enabled
         if self.adaptive_embeddings:
             query_stats = {'access_count': 1, 'recency_score': 1.0, 'diversity_score': 0.5}
@@ -355,17 +373,65 @@ class MemoryRouter:
 
     def _store_component_embeddings(self, rec: MemoryRecord) -> None:
         """Generate and store component embeddings for a memory record."""
-        memory_dict = rec.dict()
-        component_embeddings = self.component_embedder.embed_all_components(memory_dict)
+        import json
 
-        # Store component embeddings in FAISS with prefixed IDs
-        if component_embeddings.get('who') is not None:
-            self.index.add(f"who:{rec.memory_id}", component_embeddings['who'])
-        if component_embeddings.get('where') is not None:
-            self.index.add(f"where:{rec.memory_id}", component_embeddings['where'])
-        if component_embeddings.get('when') is not None:
-            self.index.add(f"when:{rec.memory_id}", component_embeddings['when'])
-        if component_embeddings.get('why') is not None:
-            self.index.add(f"why:{rec.memory_id}", component_embeddings['why'])
-        if component_embeddings.get('how') is not None:
-            self.index.add(f"how:{rec.memory_id}", component_embeddings['how'])
+        # Process WHO embeddings
+        if rec.who and rec.who.id:
+            who_vec = self.embedder.encode([rec.who.id], normalize_embeddings=True)[0]
+            self.index.add(f"who:{rec.memory_id}", who_vec)
+            self.store.store_component_embedding(
+                rec.memory_id, 'who', rec.who.id,
+                who_vec.astype('float32').tobytes(), who_vec.shape[0]
+            )
+
+        # Process WHO_LIST embeddings
+        if rec.who_list:
+            try:
+                who_entities = json.loads(rec.who_list) if isinstance(rec.who_list, str) else rec.who_list
+                for entity in who_entities:
+                    if entity:
+                        entity_vec = self.embedder.encode([entity], normalize_embeddings=True)[0]
+                        self.store.store_component_embedding(
+                            rec.memory_id, 'who', entity,
+                            entity_vec.astype('float32').tobytes(), entity_vec.shape[0]
+                        )
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Process WHERE embeddings
+        if rec.where and rec.where.value:
+            where_vec = self.embedder.encode([rec.where.value], normalize_embeddings=True)[0]
+            self.index.add(f"where:{rec.memory_id}", where_vec)
+            self.store.store_component_embedding(
+                rec.memory_id, 'where', rec.where.value,
+                where_vec.astype('float32').tobytes(), where_vec.shape[0]
+            )
+
+        # Process WHERE_LIST embeddings
+        if rec.where_list:
+            try:
+                where_entities = json.loads(rec.where_list) if isinstance(rec.where_list, str) else rec.where_list
+                for entity in where_entities:
+                    if entity:
+                        entity_vec = self.embedder.encode([entity], normalize_embeddings=True)[0]
+                        self.store.store_component_embedding(
+                            rec.memory_id, 'where', entity,
+                            entity_vec.astype('float32').tobytes(), entity_vec.shape[0]
+                        )
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Process key WHAT entities (optional - only the most important ones)
+        if rec.what:
+            try:
+                what_entities = json.loads(rec.what) if isinstance(rec.what, str) else [rec.what]
+                # Only embed first 3 most important entities to avoid explosion
+                for entity in what_entities[:3]:
+                    if entity:
+                        entity_vec = self.embedder.encode([entity], normalize_embeddings=True)[0]
+                        self.store.store_component_embedding(
+                            rec.memory_id, 'what', entity,
+                            entity_vec.astype('float32').tobytes(), entity_vec.shape[0]
+                        )
+            except (json.JSONDecodeError, TypeError):
+                pass

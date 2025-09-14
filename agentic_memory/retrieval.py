@@ -11,6 +11,7 @@ from .storage.faiss_index import FaissIndex
 from .types import RetrievalQuery, Candidate
 from .embedding.component_embedder import get_component_embedder
 from .embedding.llama_embedder import get_llama_embedder
+from .embedding.instruction_generator import get_instruction_generator
 # Attention mechanisms removed - using fixed weight comprehensive scoring only
 
 def exp_recency(ts_iso: str, now: datetime, half_life_hours: float = 72.0) -> float:
@@ -33,6 +34,7 @@ class HybridRetriever:
         self.index = index
         self.component_embedder = get_component_embedder()
         self.embedder = get_llama_embedder()
+        self.instruction_generator = get_instruction_generator()
 
         # No attention mechanisms - using comprehensive scoring with fixed weights
 
@@ -63,74 +65,101 @@ class HybridRetriever:
     def _actor_based(self, actor_hint: str, topk: int) -> List[Tuple[str, float]]:
         """Retrieve memories from specific actor using semantic similarity.
 
-        This now uses embeddings to find semantically similar actors,
-        not just exact matches.
+        Uses both FAISS and database component embeddings for comprehensive search.
         """
-        # Generate embedding for the actor hint
+        # Generate embedding for the actor hint with appropriate instruction
+        actor_instruction = self.instruction_generator.generate_component_instruction('who', actor_hint)
         actor_embedding = self.component_embedder.embed_who(actor_hint)
         if actor_embedding is None:
-            return []
+            # Fallback to using main embedder with instruction if component embedder fails
+            actor_embedding = self.embedder.encode([actor_hint], normalize_embeddings=True, instruction=actor_instruction)[0]
 
-        # Search for similar actor embeddings in FAISS
-        # We store component embeddings with prefixed IDs
-        # Limit to reasonable number to avoid performance issues
+        memory_scores = {}
+
+        # Method 1: Search in database component_embeddings table
+        try:
+            db_results = self.store.search_by_component(
+                'who',
+                actor_embedding.astype('float32').tobytes(),
+                limit=topk * 2
+            )
+            for memory_id, score in db_results:
+                memory_scores[memory_id] = max(memory_scores.get(memory_id, 0), score)
+        except Exception:
+            # Table might not exist yet or query failed
+            pass
+
+        # Method 2: Search for FAISS indexed components
         search_limit = min(topk * 2, 100)  # Cap at 100 for performance
         results = self.index.search(actor_embedding, search_limit)
 
         # Filter to only 'who:' prefixed entries and extract memory IDs
-        memory_scores = {}
         for item_id, score in results:
             if item_id.startswith('who:'):
                 memory_id = item_id[4:]  # Remove 'who:' prefix
                 # Normalize score to [0, 1]
                 norm_score = (score + 1.0) / 2.0
-                memory_scores[memory_id] = max(0.0, min(1.0, norm_score))
+                memory_scores[memory_id] = max(memory_scores.get(memory_id, 0), norm_score)
 
-        # If no semantic matches found, fall back to exact match
+        # Method 3: Fallback to exact match if no semantic matches
         if not memory_scores:
             rows = self.store.get_by_actor(actor_hint, limit=topk)
             if rows:
                 for row in rows:
                     memory_scores[row['memory_id']] = 0.5  # Medium confidence for exact match
 
-        # Convert to list format
-        results = list(memory_scores.items())[:topk]
+        # Sort by score and return top K
+        results = sorted(memory_scores.items(), key=lambda x: x[1], reverse=True)[:topk]
         return results
     
     def _where_based(self, where_value: str, topk: int) -> List[Tuple[str, float]]:
         """Retrieve memories from specific WHERE location using semantic similarity.
 
-        This now uses embeddings to find semantically similar locations,
-        not just exact matches.
+        Uses both FAISS and database component embeddings for comprehensive search.
         """
-        # Generate embedding for the location hint
+        # Generate embedding for the location hint with appropriate instruction
+        where_instruction = self.instruction_generator.generate_component_instruction('where', where_value)
         where_embedding = self.component_embedder.embed_where(where_value)
         if where_embedding is None:
-            return []
+            # Fallback to using main embedder with instruction if component embedder fails
+            where_embedding = self.embedder.encode([where_value], normalize_embeddings=True, instruction=where_instruction)[0]
 
-        # Search for similar location embeddings in FAISS
-        # Limit to reasonable number to avoid performance issues
+        memory_scores = {}
+
+        # Method 1: Search in database component_embeddings table
+        try:
+            db_results = self.store.search_by_component(
+                'where',
+                where_embedding.astype('float32').tobytes(),
+                limit=topk * 2
+            )
+            for memory_id, score in db_results:
+                memory_scores[memory_id] = max(memory_scores.get(memory_id, 0), score)
+        except Exception:
+            # Table might not exist yet or query failed
+            pass
+
+        # Method 2: Search for FAISS indexed components
         search_limit = min(topk * 2, 100)  # Cap at 100 for performance
         results = self.index.search(where_embedding, search_limit)
 
         # Filter to only 'where:' prefixed entries and extract memory IDs
-        memory_scores = {}
         for item_id, score in results:
             if item_id.startswith('where:'):
                 memory_id = item_id[6:]  # Remove 'where:' prefix
                 # Normalize score to [0, 1]
                 norm_score = (score + 1.0) / 2.0
-                memory_scores[memory_id] = max(0.0, min(1.0, norm_score))
+                memory_scores[memory_id] = max(memory_scores.get(memory_id, 0), norm_score)
 
-        # If no semantic matches found, fall back to exact match
+        # Method 3: Fallback to exact match if no semantic matches
         if not memory_scores:
             rows = self.store.get_by_location(where_value, limit=topk)
             if rows:
                 for row in rows:
                     memory_scores[row['memory_id']] = 0.5  # Medium confidence for exact match
 
-        # Convert to list format
-        results = list(memory_scores.items())[:topk]
+        # Sort by score and return top K
+        results = sorted(memory_scores.items(), key=lambda x: x[1], reverse=True)[:topk]
         return results
     
     def _temporal_based(self, temporal_hint: Union[str, Tuple[str, str], Dict], topk: int) -> List[Tuple[str, float]]:

@@ -30,12 +30,21 @@ def get_embedder():
 
 # Shared field extraction rules
 FIELD_EXTRACTION_RULES = """
-Extract for WHO_LIST: People, organizations, teams, roles, departments mentioned
+CRITICAL: Extract WHO and WHERE from the CONTENT ITSELF, not from chat metadata!
+
+Extract for WHO (primary actor/subject IN THE CONTENT):
+- Look for the MAIN subject performing actions or being discussed in the content
+- "The AI assistant asks the user..." → who: {type: "llm", id: "AI assistant"}
+- "The user requested help..." → who: {type: "user", id: "user"}
+- "John Smith analyzed the data..." → who: {type: "person", id: "John Smith"}
+- ONLY use metadata (Actor field) if the content provides NO clear subject
+
+Extract for WHO_LIST: ALL people, organizations, entities mentioned in content
 - "The CEO told the marketing team" → ["CEO", "marketing team"]
 - "Alice and Bob from engineering" → ["Alice", "Bob", "engineering"]
-- "OpenAI's GPT-4" → ["OpenAI", "GPT-4"]
+- "The AI assistant asks the user" → ["AI assistant", "user"]
 
-Extract for WHAT: Key entities, concepts, and topics
+Extract for WHAT: Key entities, concepts, and topics from the content
 - Names of people, organizations, teams, products
 - Technical terms, genes, proteins, chemicals
 - Programming languages, frameworks, tools
@@ -48,29 +57,46 @@ Extract for WHEN_LIST: Time expressions and temporal references
 - "last week's sprint" → ["last week", "sprint"]
 - "Q3 2024 planning" → ["Q3 2024", "planning period"]
 
+Extract for WHERE (location/context FROM THE CONTENT):
+- Look for actual locations or contexts mentioned IN the text
+- "regarding dinner prep" → {type: "conceptual", value: "dinner preparation context"}
+- "in the kitchen" → {type: "physical", value: "kitchen"}
+- "on the login page" → {type: "digital", value: "login page"}
+- ONLY use "local_ui" if no location/context is mentioned in content
+
 Extract for WHERE_LIST: Locations, places, and contexts
 - "in the conference room at headquarters" → ["conference room", "headquarters"]
 - "on GitHub in the main repository" → ["GitHub", "main repository"]
 - "Seattle office's lab" → ["Seattle office", "lab"]
 
 Examples:
-- "asked which genes encode Growth hormone (GH) and insulin-like growth factor 1" → what: ["genes", "Growth hormone", "GH", "insulin-like growth factor 1", "IGF-1", "encoding"]
+- "The AI assistant asks the user to provide more context about dinner prep"
+  → who: {type: "llm", id: "AI assistant"}, who_list: ["AI assistant", "user"],
+    where: {type: "conceptual", value: "dinner preparation"}, what: ["context", "dinner prep"]
 - "Python script for data analysis" → what: ["Python", "script", "data analysis"]
-- "Player X was traded from Team A to Team B" → who_list: ["Player X"], what: ["trade", "sports transaction"], where_list: ["Team A", "Team B"]
+- "Player X was traded from Team A to Team B" → who: {type: "person", id: "Player X"},
+    who_list: ["Player X"], what: ["trade", "sports transaction"], where_list: ["Team A", "Team B"]
 """
 
 # Base schema for 5W1H extraction
 BASE_SCHEMA = """
 {
-  "who": { "type": "<actor type e.g. user, llm, tool, system, team, group, organization>", "id": "<string identifier>", "label": "<optional descriptive label>" },
-  "who_list": ["<person1>", "<person2>", "<organization>", ...],
-  "what": ["<entity1>", "<entity2>", ...],
+  "who": {
+    "type": "<PRIMARY subject/actor mentioned IN THE CONTENT (not chat metadata): person, llm, user, organization, system, etc>",
+    "id": "<identifier of the subject AS MENTIONED IN THE CONTENT>",
+    "label": "<optional descriptive label from content>"
+  },
+  "who_list": ["<ALL people/entities/actors mentioned in the content>"],
+  "what": ["<key topics/entities/concepts from the content>"],
   "when": "<ISO 8601 timestamp>",
-  "when_list": ["<time_expression1>", "<date_reference>", "<temporal_phrase>", ...],
-  "where": { "type": "<context type e.g. physical, digital, financial, academic, conceptual, social>", "value": "<specific context like UI path, URL, file, location, or domain>" },
-  "where_list": ["<location1>", "<place2>", "<context>", ...],
-  "why": "<best-effort intent or reason - IMPORTANT: if the user is asking to recall memories, searching for information, or asking 'what do you remember about X' or 'is there any memory about Y', set this to 'memory_recall: <topic>' where <topic> is what they're trying to recall>",
-  "how": "<method used, tool/procedure/parameters>"
+  "when_list": ["<time expressions mentioned in content>"],
+  "where": {
+    "type": "<location type FROM CONTENT: physical, digital, conceptual, social, etc>",
+    "value": "<SPECIFIC location/context mentioned IN THE CONTENT (not 'local_ui' unless content says so)>"
+  },
+  "where_list": ["<ALL locations/places/contexts mentioned in content>"],
+  "why": "<intent or reason extracted from content - for memory recall queries use 'memory_recall: <topic>'>",
+  "how": "<method/procedure mentioned in content>"
 }
 """
 
@@ -175,8 +201,16 @@ class BaseExtractor:
         total_parts: Optional[int] = None
     ) -> MemoryRecord:
         """Create a MemoryRecord from parsed data."""
-        # Process who field
-        who_data = parsed.get('who', {'type': 'system', 'id': raw.actor})
+        # Process who field - trust the LLM extraction or use basic fallback
+        who_data = parsed.get('who')
+        if not who_data:
+            # Basic fallback based on event type only
+            if raw.event_type == 'user_message':
+                who_data = {'type': 'user', 'id': raw.actor, 'label': 'User'}
+            elif raw.event_type == 'llm_message':
+                who_data = {'type': 'llm', 'id': raw.actor, 'label': 'Assistant'}
+            else:
+                who_data = {'type': 'system', 'id': raw.actor}
         who = Who(**who_data)
 
         # Process list fields
@@ -190,11 +224,17 @@ class BaseExtractor:
             fallback=raw.content[:160]
         )
 
-        # Process where field
-        where_data = parsed.get('where', {'type': 'digital', 'value': 'local_ui'})
+        # Process where field - trust the LLM extraction or use basic fallback
+        where_data = parsed.get('where')
+        if not where_data:
+            # Basic fallback - no content parsing
+            if raw.metadata.get('location'):
+                where_data = {'type': 'digital', 'value': raw.metadata.get('location')}
+            else:
+                where_data = {'type': 'digital', 'value': 'conversation'}
         where = Where(
             type=where_data.get('type', 'digital'),
-            value=where_data.get('value', 'local_ui')
+            value=where_data.get('value', 'conversation')
         )
 
         # Process why and how
@@ -239,14 +279,16 @@ class BaseExtractor:
 
     def create_fallback_parsed(self, raw: RawEvent) -> Dict[str, Any]:
         """Create fallback parsed data when LLM extraction fails."""
+        # Only use basic event type mapping - no content parsing
+        # The LLM should handle all content extraction
         who_type = 'tool' if raw.event_type in ('tool_call', 'tool_result') else \
                    ('user' if raw.event_type == 'user_message' else \
                    ('llm' if raw.event_type == 'llm_message' else 'system'))
 
         return {
             'who': {'type': who_type, 'id': raw.actor, 'label': None},
-            'what': [raw.metadata.get('operation', raw.content[:160])],
-            'where': {'type': 'digital', 'value': raw.metadata.get('location', 'local_ui')},
+            'what': [raw.content[:160]],  # Just use first part of content
+            'where': {'type': 'digital', 'value': raw.metadata.get('location', 'conversation')},
             'why': raw.metadata.get('intent', 'unspecified'),
             'how': raw.metadata.get('method', 'message')
         }
