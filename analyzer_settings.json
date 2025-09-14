@@ -1,6 +1,6 @@
 {
   "weights": {
-    "semantic": 0.68,
+    "semantic": 1,
     "recency": 0.02,
     "actor": 0.1,
     "temporal": 0.1,
@@ -37,6 +37,6 @@
   },
   "_metadata": {
     "version": "1.0",
-    "last_modified": "2025-09-13T19:21:48.108488"
+    "last_modified": "2025-09-13T20:31:03.091769"
   }
 }

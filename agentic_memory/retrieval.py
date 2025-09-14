@@ -3,6 +3,7 @@ from typing import List, Dict, Tuple, Optional, Union, Any
 import numpy as np
 import json
 import re
+import time
 from datetime import datetime, timezone
 from .config import cfg
 from .storage.sql_store import MemoryStore
@@ -193,27 +194,44 @@ class HybridRetriever:
                            temporal_matches: Dict[str, float],
                            spatial_matches: Optional[Dict[str, float]] = None) -> List[Candidate]:
         """Compute comprehensive scores for all candidates across all dimensions."""
-        
+
         # Fetch metadata for all candidates
         if not memory_ids:
             return []
+
+        print(f"  [SCORING] Fetching metadata for {len(memory_ids)} memories...")
+        fetch_start = time.time()
         
         memories = self.store.fetch_memories(memory_ids)
         memory_dict = {m['memory_id']: m for m in memories}
+        print(f"  [SCORING] Fetched {len(memories)} memories in {time.time() - fetch_start:.2f}s")
         
         # Get usage stats for all candidates
+        print(f"  [SCORING] Getting usage stats...")
+        usage_start = time.time()
         usage_stats = self.store.get_usage_stats(memory_ids)
+        print(f"  [SCORING] Got usage stats in {time.time() - usage_start:.2f}s")
         
         # Current time for recency calculation
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         
         # Group memories by topic/entity for smart recency application
+        print(f"  [SCORING] Grouping related memories...")
+        group_start = time.time()
         memory_groups = self._group_related_memories(memories, sem_scores, lex_scores)
+        print(f"  [SCORING] Grouped memories in {time.time() - group_start:.2f}s")
         
         # Calculate candidates with all dimension scores
         candidates = []
-        
+
+        print(f"  [SCORING] Calculating final scores...")
+        score_calc_start = time.time()
+        processed = 0
+
         for memory_id in memory_ids:
+            processed += 1
+            if processed % 1000 == 0:
+                print(f"  [SCORING] Processed {processed}/{len(memory_ids)} memories...")
             memory = memory_dict.get(memory_id)
             if not memory:
                 continue
@@ -229,20 +247,9 @@ class HybridRetriever:
             base_recency = exp_recency(when_ts, now, half_life_hours=168.0)
             recency_score = self._apply_smart_recency(memory_id, base_recency, memory_groups)
             
-            # 4. Actor match (semantic similarity or from matches)
+            # 4. Actor match (from pre-computed search results only)
+            # No on-the-fly generation - embeddings should already exist in index
             actor_score = actor_matches.get(memory_id, 0.0)
-            if not actor_score and query.actor_hint:
-                # Generate semantic similarity score on the fly if needed
-                # This is a fallback - ideally should be in actor_matches already
-                who_data = self._extract_who_for_memory(memory)
-                if who_data:
-                    actor_hint_emb = self.component_embedder.embed_who(query.actor_hint)
-                    who_emb = self.component_embedder.embed_who(who_data)
-                    if actor_hint_emb is not None and who_emb is not None:
-                        # Compute cosine similarity
-                        similarity = np.dot(actor_hint_emb, who_emb)
-                        # Already normalized, similarity is in [-1, 1]
-                        actor_score = max(0.0, (similarity + 1.0) / 2.0)
             
             # 5. Temporal match (binary or from hint)
             temporal_score = temporal_matches.get(memory_id, 0.0)
@@ -295,7 +302,8 @@ class HybridRetriever:
             )
             
             candidates.append(candidate)
-        
+
+        print(f"  [SCORING] Calculated {len(candidates)} scores in {time.time() - score_calc_start:.2f}s")
         return candidates
 
     
@@ -559,6 +567,10 @@ class HybridRetriever:
         # REDESIGNED: Retrieve large candidate set and score comprehensively
         # The topk parameters now only control the FINAL output size, not initial retrieval
 
+        search_start = time.time()
+        print(f"\n[SEARCH] Starting search with topk={topk_sem}, component_search={enable_component_search}")
+        print(f"[SEARCH] Query: {rq.text[:100]}..." if len(rq.text) > 100 else f"[SEARCH] Query: {rq.text}")
+
         # Step 1: Get large candidate sets from each source (cast wide net)
         # Use topk_sem for retrieval size (will be 999999 from analyzer)
         initial_retrieval_size = topk_sem
@@ -568,8 +580,11 @@ class HybridRetriever:
             rq.actor_hint = self._extract_actor_from_query(rq.text)
 
         # Get semantic candidates (vector similarity)
+        print(f"[SEARCH] Retrieving semantic candidates (limit: {initial_retrieval_size})...")
+        sem_start = time.time()
         sem = self._semantic(qvec, initial_retrieval_size)
         sem_dict = {mid: score for mid, score in sem}
+        print(f"[SEARCH] Found {len(sem_dict)} semantic candidates in {time.time() - sem_start:.2f}s")
 
         # Lexical search removed - using semantic only
         lex_dict = {}  # Empty dict for backward compatibility
@@ -577,8 +592,11 @@ class HybridRetriever:
         # Get actor-specific candidates if hint provided or extracted
         actor_candidates = []
         if enable_component_search and rq.actor_hint:
+            print(f"[SEARCH] Searching for actor: {rq.actor_hint}...")
+            actor_start = time.time()
             # Limit actor search for performance
             actor_candidates = self._actor_based(rq.actor_hint, min(50, topk_sem // 10))
+            print(f"[SEARCH] Found {len(actor_candidates)} actor matches in {time.time() - actor_start:.2f}s")
         actor_dict = {mid: score for mid, score in actor_candidates}  # Now using similarity scores
         
         # Get location-specific candidates if location detected in query
@@ -586,18 +604,25 @@ class HybridRetriever:
         if enable_component_search:
             location_hint = self._extract_location_from_query(rq.text)
             if location_hint:
+                print(f"[SEARCH] Searching for location: {location_hint}...")
+                location_start = time.time()
                 # Limit location search for performance
                 spatial_candidates = self._where_based(location_hint, min(50, topk_sem // 10))
+                print(f"[SEARCH] Found {len(spatial_candidates)} location matches in {time.time() - location_start:.2f}s")
         self._spatial_matches = {mid: score for mid, score in spatial_candidates}
 
         # Get temporal candidates if hint provided
         temporal_candidates = []
         if enable_component_search and rq.temporal_hint:
+            print(f"[SEARCH] Searching for temporal: {rq.temporal_hint}...")
+            temporal_start = time.time()
             # Limit temporal search for performance
             temporal_candidates = self._temporal_based(rq.temporal_hint, min(50, topk_sem // 10))
+            print(f"[SEARCH] Found {len(temporal_candidates)} temporal matches in {time.time() - temporal_start:.2f}s")
         temporal_dict = {mid: 1.0 for mid, _ in temporal_candidates}  # Binary match
         
         # Step 2: Combine all unique memory IDs
+        print(f"[SEARCH] Combining candidate sets...")
         all_memory_ids = set()
         all_memory_ids.update(sem_dict.keys())
         all_memory_ids.update(lex_dict.keys())
@@ -605,8 +630,11 @@ class HybridRetriever:
         all_memory_ids.update(temporal_dict.keys())
         if hasattr(self, '_spatial_matches'):
             all_memory_ids.update(self._spatial_matches.keys())
+        print(f"[SEARCH] Total unique candidates: {len(all_memory_ids)}")
         
         # Step 3: Compute comprehensive scores for all candidates
+        print(f"[SEARCH] Computing comprehensive scores for {len(all_memory_ids)} candidates...")
+        scoring_start = time.time()
         candidates = self.compute_all_scores(
             memory_ids=list(all_memory_ids),
             query_vec=qvec,
@@ -617,12 +645,19 @@ class HybridRetriever:
             temporal_matches=temporal_dict,
             spatial_matches=getattr(self, '_spatial_matches', {})
         )
+        print(f"[SEARCH] Scored {len(candidates)} candidates in {time.time() - scoring_start:.2f}s")
         
         # Step 4: Apply final top-K selection
+        print(f"[SEARCH] Selecting top {topk_sem} candidates...")
         candidates.sort(key=lambda x: x.score, reverse=True)
         final_k = min(topk_sem, len(candidates))
         top_k_candidates = candidates[:final_k]
-        
+
+        total_time = time.time() - search_start
+        print(f"[SEARCH] Search complete: {final_k} results in {total_time:.2f}s")
+        if len(top_k_candidates) > 0:
+            print(f"[SEARCH] Top score: {top_k_candidates[0].score:.3f}, Bottom score: {top_k_candidates[-1].score:.3f}")
+
         return top_k_candidates
     
     def get_current_weights(self) -> Dict[str, float]:

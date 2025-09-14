@@ -4,6 +4,7 @@ import json
 import sqlite3
 import csv
 import io
+import time
 from flask import Flask, render_template, request, jsonify, session, make_response
 from datetime import datetime
 import numpy as np
@@ -110,7 +111,10 @@ def search():
         candidates = retriever.search_with_weights(rq, qvec, weights, topk_sem=initial_top_k, topk_lex=initial_top_k)
         
         # Apply knapsack algorithm to select memories within token budget
+        print(f"[ANALYZER API] Running knapsack algorithm...")
+        knapsack_start = time.time()
         selected_ids, tokens_used = greedy_knapsack(candidates, token_budget)
+        print(f"[ANALYZER API] Knapsack selected {len(selected_ids)} memories using {tokens_used} tokens in {time.time() - knapsack_start:.2f}s")
         
         # Filter candidates to only selected ones
         selected_candidates = [c for c in candidates if c.memory_id in selected_ids]
@@ -1305,7 +1309,10 @@ def memory_search():
         candidates = retriever.search_with_weights(rq, qvec, weights, topk_sem=initial_candidates, topk_lex=initial_candidates)
 
         # Apply knapsack algorithm to select memories within token budget
+        print(f"[ANALYZER API] Running knapsack algorithm...")
+        knapsack_start = time.time()
         selected_ids, tokens_used = greedy_knapsack(candidates, token_budget)
+        print(f"[ANALYZER API] Knapsack selected {len(selected_ids)} memories using {tokens_used} tokens in {time.time() - knapsack_start:.2f}s")
 
         # Filter candidates to only selected ones
         selected_candidates = [c for c in candidates if c.memory_id in selected_ids]
