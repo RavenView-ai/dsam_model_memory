@@ -103,7 +103,7 @@ class HybridRetriever:
 
         # Method 3: Fallback to exact match if no semantic matches
         if not memory_scores:
-            rows = self.store.get_by_actor(actor_hint, limit=topk)
+            rows = self.store.get_by_actor(actor_hint, limit=topk, require_embeddings=True)
             if rows:
                 for row in rows:
                     memory_scores[row['memory_id']] = 0.5  # Medium confidence for exact match
@@ -153,7 +153,7 @@ class HybridRetriever:
 
         # Method 3: Fallback to exact match if no semantic matches
         if not memory_scores:
-            rows = self.store.get_by_location(where_value, limit=topk)
+            rows = self.store.get_by_location(where_value, limit=topk, require_embeddings=True)
             if rows:
                 for row in rows:
                     memory_scores[row['memory_id']] = 0.5  # Medium confidence for exact match
@@ -180,11 +180,11 @@ class HybridRetriever:
                 date_part = temporal_hint.split('T')[0]
             else:
                 date_part = temporal_hint
-            rows = self.store.get_by_date(date_part, limit=topk)
+            rows = self.store.get_by_date(date_part, limit=topk, require_embeddings=True)
         elif isinstance(temporal_hint, tuple) and len(temporal_hint) == 2:
             # Date range
             start, end = temporal_hint
-            rows = self.store.get_by_date_range(start, end, limit=topk)
+            rows = self.store.get_by_date_range(start, end, limit=topk, require_embeddings=True)
         elif isinstance(temporal_hint, dict):
             if "relative" in temporal_hint:
                 # Relative time like "yesterday", "last_week"
@@ -193,7 +193,7 @@ class HybridRetriever:
                 # Timestamp range - extract dates
                 start = temporal_hint["start"].split("T")[0] if "T" in temporal_hint["start"] else temporal_hint["start"]
                 end = temporal_hint["end"].split("T")[0] if "T" in temporal_hint["end"] else temporal_hint["end"]
-                rows = self.store.get_by_date_range(start, end, limit=topk)
+                rows = self.store.get_by_date_range(start, end, limit=topk, require_embeddings=True)
             else:
                 return []
         else:
@@ -230,10 +230,11 @@ class HybridRetriever:
 
         print(f"  [SCORING] Fetching metadata for {len(memory_ids)} memories...")
         fetch_start = time.time()
-        
-        memories = self.store.fetch_memories(memory_ids)
+
+        # Only fetch memories that have valid embeddings
+        memories = self.store.fetch_memories(memory_ids, require_embeddings=True)
         memory_dict = {m['memory_id']: m for m in memories}
-        print(f"  [SCORING] Fetched {len(memories)} memories in {time.time() - fetch_start:.2f}s")
+        print(f"  [SCORING] Fetched {len(memories)} memories with valid embeddings in {time.time() - fetch_start:.2f}s")
         
         # Get usage stats for all candidates
         print(f"  [SCORING] Getting usage stats...")
@@ -272,7 +273,7 @@ class HybridRetriever:
             
             # 3. Smart recency score (only applies as tiebreaker for related memories)
             when_list = json.loads(memory.get('when_list', '[]')) if memory.get('when_list') else []
-            when_ts = when_list[0] if when_list else memory.get('when_list', '[]')
+            when_ts = when_list[0] if when_list else memory.get('when_ts', '')
             base_recency = exp_recency(when_ts, now, half_life_hours=168.0)
             recency_score = self._apply_smart_recency(memory_id, base_recency, memory_groups)
             
@@ -301,12 +302,12 @@ class HybridRetriever:
             # Fixed weight combination 
             # Default weights (can be configured)
             # Note: recency is reduced since it's now a smart tiebreaker
-            w_semantic = 0.68
-            w_recency = 0.02  # Small weight - mainly acts as tiebreaker
-            w_actor = 0.10
-            w_temporal = 0.10
-            w_spatial = 0.05
-            w_usage = 0.05
+            w_semantic = 0.84
+            w_recency = 0.00  # Small weight - mainly acts as tiebreaker
+            w_actor = 0.00
+            w_temporal = 0.08
+            w_spatial = 0.04
+            w_usage = 0.04
 
             final_score = (
                 w_semantic * semantic_score +
@@ -377,7 +378,23 @@ class HybridRetriever:
                     # Check different types of relatedness:
                     
                     # 1. Same actor discussing similar topic (updates/corrections)
-                    if json.loads(memory.get('who_list', '[]'))[0] if json.loads(memory.get('who_list', '[]')) else '' == json.loads(other_memory.get('who_list', '[]'))[0] if json.loads(other_memory.get('who_list', '[]')) else '' and entity_overlap > 3:
+                    # Safely parse who_list for both memories
+                    memory_who = []
+                    other_who = []
+                    try:
+                        if memory.get('who_list'):
+                            memory_who = json.loads(memory.get('who_list', '[]'))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    try:
+                        if other_memory.get('who_list'):
+                            other_who = json.loads(other_memory.get('who_list', '[]'))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                    # Compare first actors if both exist
+                    if (memory_who and other_who and
+                        memory_who[0] == other_who[0] and entity_overlap > 3):
                         is_related = True
                     
                     # 2. High overlap ratio (>40% of words in common) - likely same topic
@@ -523,17 +540,33 @@ class HybridRetriever:
             importance = 0.0  # Will be computed during attention phase if needed
             
             # Extra signals
-            when_list_for_rec = json.loads(m.get('when_list', '[]'))
-            rec_date = when_list_for_rec[0] if when_list_for_rec else ''
+            when_list_for_rec = []
+            if m.get('when_list'):
+                try:
+                    when_list_for_rec = json.loads(m.get('when_list', '[]'))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            rec_date = when_list_for_rec[0] if when_list_for_rec else m.get('when_ts', '')
             rec = exp_recency(rec_date, now)
-            who_list = json.loads(m.get('who_list', '[]'))
+
+            who_list = []
+            if m.get('who_list'):
+                try:
+                    who_list = json.loads(m.get('who_list', '[]'))
+                except (json.JSONDecodeError, TypeError):
+                    pass
             first_who = who_list[0] if who_list else ''
             actor_match = 1.0 if (rq.actor_hint and first_who == rq.actor_hint) else 0.0
             
             # Check temporal match
             temporal_match = 0.0
             if has_temporal_hint:
-                when_list = json.loads(m.get('when_list', '[]'))
+                when_list = []
+                if m.get('when_list'):
+                    try:
+                        when_list = json.loads(m.get('when_list', '[]'))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
                 if when_list:
                     mem_date = when_list[0]
                     if 'T' in mem_date:
@@ -693,12 +726,12 @@ class HybridRetriever:
         """Return current weight configuration for UI display"""
         # Redistributed weights after removing lexical (was 0.25)
         return {
-            'semantic': 0.68,
-            'recency': 0.02,
-            'actor': 0.10,
-            'temporal': 0.10,
-            'spatial': 0.05,
-            'usage': 0.05
+            'semantic': 0.84,
+            'recency': 0.00,
+            'actor': 0.00,
+            'temporal': 0.08,
+            'spatial': 0.04,
+            'usage': 0.04
         }
     
     def update_weights(self, weights: Dict[str, float]) -> Dict[str, float]:
@@ -721,9 +754,9 @@ class HybridRetriever:
         if not candidates:
             return []
         
-        # Fetch full memory details
+        # Fetch full memory details (only those with valid embeddings)
         memory_ids = [c.memory_id for c in candidates]
-        memories = self.store.fetch_memories(memory_ids)
+        memories = self.store.fetch_memories(memory_ids, require_embeddings=True)
         # Convert SQLite Row objects to dictionaries
         memory_dict = {dict(m)['memory_id']: dict(m) for m in memories}
         
@@ -736,22 +769,22 @@ class HybridRetriever:
             # Extract entities from 'what' field
             entities = self.extract_entities_from_what(memory.get('what', ''))
             
-            # Extract lists from JSON fields
-            who_list = self.extract_list_from_json(memory.get('who_list', ''))
-            when_list = self.extract_list_from_json(memory.get('when_list', ''))
-            where_list = self.extract_list_from_json(memory.get('where_list', ''))
+            # Extract lists from JSON fields - handle None values
+            who_list = self.extract_list_from_json(memory.get('who_list') or '[]')
+            when_list = self.extract_list_from_json(memory.get('when_list') or '[]')
+            where_list = self.extract_list_from_json(memory.get('where_list') or '[]')
             
             detailed.append({
                 'memory_id': c.memory_id,
                 'raw_text': memory.get('raw_text', ''),
                 'entities': entities,  # This is the 'what' list extracted/parsed
                 'what': memory.get('what', ''),  # Raw what field from database
-                'who': memory.get('who_list', '[]'),
+                'who': memory.get('who_list') or '[]',
                 'who_id': memory.get('who_id', ''),
                 'who_label': memory.get('who_label', ''),
                 'who_type': memory.get('who_type', ''),
                 'who_list': who_list,
-                'when': memory.get('when_list', '[]'),
+                'when': memory.get('when_list') or '[]',
                 'when_ts': memory.get('when_ts', ''),
                 'when_list': when_list,
                 'where': memory.get('where_value', ''),
@@ -921,7 +954,7 @@ class HybridRetriever:
                 parsed = json.loads(who_list) if isinstance(who_list, str) else who_list
                 if parsed:
                     return parsed
-            except:
+            except (json.JSONDecodeError, TypeError):
                 pass
 
         # Try structured who fields

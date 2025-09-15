@@ -69,7 +69,6 @@ Analyze the query for any temporal references such as:
 - Relative dates: "yesterday", "last week", "two days ago", "last Tuesday"
 - Date ranges: "last month", "this week", "between Monday and Friday"
 - Time periods: "in the morning", "afternoon of January 10th"
-- Fuzzy references: "recently", "a while ago", "the other day"
 
 Return a JSON object with one of these formats:
 1. For specific date: {{"type": "date", "value": "YYYY-MM-DD"}}

@@ -115,10 +115,20 @@ class MemoryStore:
                 (rec.memory_id, datetime.now(timezone.utc).astimezone().isoformat())
             )
 
-    def fetch_memories(self, ids: List[str]):
+    def fetch_memories(self, ids: List[str], require_embeddings: bool = True):
         qmarks = ','.join('?' * len(ids))
         with self.connect() as con:
-            rows = con.execute(f"SELECT * FROM memories WHERE memory_id IN ({qmarks})", ids).fetchall()
+            if require_embeddings:
+                # Only fetch memories that have valid embeddings
+                rows = con.execute(f"""
+                    SELECT m.* FROM memories m
+                    INNER JOIN embeddings e ON m.memory_id = e.memory_id
+                    WHERE m.memory_id IN ({qmarks})
+                    AND e.vector IS NOT NULL
+                """, ids).fetchall()
+            else:
+                # Original behavior - fetch all memories regardless of embeddings
+                rows = con.execute(f"SELECT * FROM memories WHERE memory_id IN ({qmarks})", ids).fetchall()
         # Convert Row objects to dictionaries
         return [dict(row) for row in rows]
 
@@ -139,28 +149,50 @@ class MemoryStore:
 
     # Lexical search removed - FTS5 was broken and not needed
 
-    def get_by_actor(self, actor_id: str, limit: int = 100) -> List[sqlite3.Row]:
+    def get_by_actor(self, actor_id: str, limit: int = 100, require_embeddings: bool = True) -> List[sqlite3.Row]:
         """Retrieve memories from a specific actor."""
-        sql = """
-            SELECT memory_id, who_id, raw_text, when_ts, token_count
-            FROM memories
-            WHERE who_id = ?
-            ORDER BY when_ts DESC
-            LIMIT ?
-        """
+        if require_embeddings:
+            sql = """
+                SELECT m.memory_id, m.who_id, m.raw_text, m.when_ts, m.token_count
+                FROM memories m
+                INNER JOIN embeddings e ON m.memory_id = e.memory_id
+                WHERE m.who_id = ?
+                AND e.vector IS NOT NULL
+                ORDER BY m.when_ts DESC
+                LIMIT ?
+            """
+        else:
+            sql = """
+                SELECT memory_id, who_id, raw_text, when_ts, token_count
+                FROM memories
+                WHERE who_id = ?
+                ORDER BY when_ts DESC
+                LIMIT ?
+            """
         with self.connect() as con:
             rows = con.execute(sql, (actor_id, limit)).fetchall()
         return rows
     
-    def get_by_location(self, location: str, limit: int = 100) -> List[sqlite3.Row]:
+    def get_by_location(self, location: str, limit: int = 100, require_embeddings: bool = True) -> List[sqlite3.Row]:
         """Retrieve memories from a specific location."""
-        sql = """
-            SELECT memory_id, where_value, raw_text, when_ts, token_count
-            FROM memories
-            WHERE where_value = ?
-            ORDER BY when_ts DESC
-            LIMIT ?
-        """
+        if require_embeddings:
+            sql = """
+                SELECT m.memory_id, m.where_value, m.raw_text, m.when_ts, m.token_count
+                FROM memories m
+                INNER JOIN embeddings e ON m.memory_id = e.memory_id
+                WHERE m.where_value = ?
+                AND e.vector IS NOT NULL
+                ORDER BY m.when_ts DESC
+                LIMIT ?
+            """
+        else:
+            sql = """
+                SELECT memory_id, where_value, raw_text, when_ts, token_count
+                FROM memories
+                WHERE where_value = ?
+                ORDER BY when_ts DESC
+                LIMIT ?
+            """
         with self.connect() as con:
             rows = con.execute(sql, (location, limit)).fetchall()
         return rows
@@ -174,28 +206,50 @@ class MemoryStore:
             count = con.execute(sql, (actor_id,)).fetchone()[0]
         return count > 0
     
-    def get_by_date(self, date: str, limit: int = 200) -> List[sqlite3.Row]:
+    def get_by_date(self, date: str, limit: int = 200, require_embeddings: bool = True) -> List[sqlite3.Row]:
         """Retrieve memories from a specific date."""
-        sql = """
-            SELECT memory_id, when_ts, raw_text, token_count, who_id, what
-            FROM memories
-            WHERE DATE(when_ts) = ?
-            ORDER BY when_ts DESC
-            LIMIT ?
-        """
+        if require_embeddings:
+            sql = """
+                SELECT m.memory_id, m.when_ts, m.raw_text, m.token_count, m.who_id, m.what
+                FROM memories m
+                INNER JOIN embeddings e ON m.memory_id = e.memory_id
+                WHERE DATE(m.when_ts) = ?
+                AND e.vector IS NOT NULL
+                ORDER BY m.when_ts DESC
+                LIMIT ?
+            """
+        else:
+            sql = """
+                SELECT memory_id, when_ts, raw_text, token_count, who_id, what
+                FROM memories
+                WHERE DATE(when_ts) = ?
+                ORDER BY when_ts DESC
+                LIMIT ?
+            """
         with self.connect() as con:
             rows = con.execute(sql, (date, limit)).fetchall()
         return rows
     
-    def get_by_date_range(self, start_date: str, end_date: str, limit: int = 200) -> List[sqlite3.Row]:
+    def get_by_date_range(self, start_date: str, end_date: str, limit: int = 200, require_embeddings: bool = True) -> List[sqlite3.Row]:
         """Retrieve memories from a date range."""
-        sql = """
-            SELECT memory_id, when_ts, raw_text, token_count, who_id, what
-            FROM memories
-            WHERE DATE(when_ts) BETWEEN ? AND ?
-            ORDER BY when_ts DESC
-            LIMIT ?
-        """
+        if require_embeddings:
+            sql = """
+                SELECT m.memory_id, m.when_ts, m.raw_text, m.token_count, m.who_id, m.what
+                FROM memories m
+                INNER JOIN embeddings e ON m.memory_id = e.memory_id
+                WHERE DATE(m.when_ts) BETWEEN ? AND ?
+                AND e.vector IS NOT NULL
+                ORDER BY m.when_ts DESC
+                LIMIT ?
+            """
+        else:
+            sql = """
+                SELECT memory_id, when_ts, raw_text, token_count, who_id, what
+                FROM memories
+                WHERE DATE(when_ts) BETWEEN ? AND ?
+                ORDER BY when_ts DESC
+                LIMIT ?
+            """
         with self.connect() as con:
             rows = con.execute(sql, (start_date, end_date, limit)).fetchall()
         return rows
@@ -212,27 +266,27 @@ class MemoryStore:
         
         if relative_spec == "today":
             target_date = reference_date.date()
-            return self.get_by_date(str(target_date), limit=200)
+            return self.get_by_date(str(target_date), limit=200, require_embeddings=True)
         elif relative_spec == "yesterday":
             target_date = (reference_date - timedelta(days=1)).date()
-            return self.get_by_date(str(target_date), limit=200)
+            return self.get_by_date(str(target_date), limit=200, require_embeddings=True)
         elif relative_spec == "last_week":
             end_date = reference_date.date()
             start_date = (reference_date - timedelta(days=7)).date()
-            return self.get_by_date_range(str(start_date), str(end_date), limit=300)
+            return self.get_by_date_range(str(start_date), str(end_date), require_embeddings=True, limit=300)
         elif relative_spec == "last_month":
             end_date = reference_date.date()
             start_date = (reference_date - timedelta(days=30)).date()
-            return self.get_by_date_range(str(start_date), str(end_date), limit=500)
+            return self.get_by_date_range(str(start_date), str(end_date), require_embeddings=True, limit=500)
         elif relative_spec == "last_year":
             end_date = reference_date.date()
             start_date = (reference_date - timedelta(days=365)).date()
-            return self.get_by_date_range(str(start_date), str(end_date), limit=1000)
+            return self.get_by_date_range(str(start_date), str(end_date), require_embeddings=True, limit=1000)
         else:
             # Default to last week if unknown
             end_date = reference_date.date()
             start_date = (reference_date - timedelta(days=7)).date()
-            return self.get_by_date_range(str(start_date), str(end_date), limit=300)
+            return self.get_by_date_range(str(start_date), str(end_date), require_embeddings=True, limit=300)
 
     # Note: Block-related methods removed as tables were dropped
     # def create_block() and get_block() were here

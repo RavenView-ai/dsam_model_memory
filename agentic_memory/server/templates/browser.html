@@ -502,6 +502,34 @@
     content: '↓';
     opacity: 1;
 }
+
+/* Temporal expression styling */
+.temporal-relative {
+    color: var(--synth-highlight);
+    font-style: italic;
+    background: rgba(123, 97, 255, 0.1);
+    padding: 2px 6px;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+.temporal-text {
+    color: var(--synth-text);
+    font-style: italic;
+    opacity: 0.9;
+}
+
+.temporal-count {
+    color: var(--synth-text-muted);
+    font-size: 0.85em;
+    margin-left: 4px;
+}
+
+/* Ensure temporal expressions in table cells are visible */
+.col-when .temporal-relative,
+.col-when .temporal-text {
+    display: inline-block;
+}
 </style>
 
 <script>
@@ -1003,9 +1031,9 @@ async function showMemoryDetails(memoryId) {
                                 </span>
                             </div>
                             <div>
-                                <strong>WHEN:</strong> 
+                                <strong>WHEN:</strong>
                                 <span style="color: var(--synth-text);">
-                                    ${formatJsonList(memory.when_list, formatDate(memory.when_ts))}
+                                    ${formatTemporalList(memory.when_list, formatDate(memory.when_ts))}
                                 </span>
                             </div>
                             <div>
@@ -1102,6 +1130,20 @@ function formatJsonList(jsonStr, fallbackValue) {
     }
 }
 
+function formatTemporalList(jsonStr, fallbackValue) {
+    try {
+        if (!jsonStr) return fallbackValue || 'N/A';
+        const list = JSON.parse(jsonStr);
+        if (Array.isArray(list) && list.length > 0) {
+            // Apply formatDate to each item to handle relative expressions
+            return list.map(item => formatDate(item)).join(', ');
+        }
+        return fallbackValue || 'N/A';
+    } catch {
+        return fallbackValue || jsonStr || 'N/A';
+    }
+}
+
 function formatWhoList(whoList, whoType, whoId) {
     try {
         if (whoList) {
@@ -1125,12 +1167,15 @@ function formatWhenList(whenList, whenTs) {
         if (whenList) {
             const list = JSON.parse(whenList);
             if (Array.isArray(list) && list.length > 0) {
-                // Format first date nicely, show count if more
-                const firstDate = formatDate(list[0]);
+                // Handle multiple temporal expressions
                 if (list.length > 1) {
-                    return `${firstDate} (+${list.length - 1})`;
+                    // Show first item and count of additional items
+                    const firstItem = formatDate(list[0]);
+                    const additionalInfo = `<span class="temporal-count">(+${list.length - 1})</span>`;
+                    return `${firstItem} ${additionalInfo}`;
                 }
-                return firstDate;
+                // Single temporal expression
+                return formatDate(list[0]);
             }
         }
     } catch {}
@@ -1156,11 +1201,34 @@ function formatWhereList(whereList, whereType, whereValue) {
 
 function formatDate(dateStr) {
     if (!dateStr) return 'N/A';
+
+    // Check if it's a relative time expression or other non-ISO format
+    const relativePatterns = [
+        /^(next|last|this)\s+(week|month|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i,
+        /^(tomorrow|yesterday|today)/i,
+        /^in\s+\d+\s+(day|week|month|year)s?/i,
+        /^\d+\s+(day|week|month|year)s?\s+ago/i,
+        /^(later|soon|eventually|recently)/i
+    ];
+
+    // Check if it matches any relative pattern
+    for (const pattern of relativePatterns) {
+        if (pattern.test(dateStr)) {
+            // Return the relative expression as-is with styling
+            return `<span class="temporal-relative">${dateStr}</span>`;
+        }
+    }
+
     try {
         const date = new Date(dateStr);
+        // Check if the date is valid
+        if (isNaN(date.getTime())) {
+            // If not a valid date, return the original string
+            return `<span class="temporal-text">${dateStr}</span>`;
+        }
         return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
     } catch {
-        return dateStr;
+        return `<span class="temporal-text">${dateStr}</span>`;
     }
 }
 

@@ -291,32 +291,39 @@ def api_memories():
         
         where_clause = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
         
-        # Get total count for pagination
-        count_query = f"SELECT COUNT(*) as total FROM memories{where_clause}"
+        # Get total count for pagination - only count memories with embeddings
+        count_query = f"""
+            SELECT COUNT(*) as total
+            FROM memories m
+            INNER JOIN embeddings e ON m.memory_id = e.memory_id
+            {where_clause.replace('WHERE', 'WHERE e.vector IS NOT NULL AND') if where_clause else 'WHERE e.vector IS NOT NULL'}
+        """
         total_count = con.execute(count_query, params).fetchone()['total']
-        
+
         # Calculate pagination
         total_pages = (total_count + per_page - 1) // per_page
         offset = (page - 1) * per_page
-        
+
         # Validate sort column
-        valid_sort_columns = ['when_ts', 'created_at', 'memory_id', 'session_id', 
+        valid_sort_columns = ['when_ts', 'created_at', 'memory_id', 'session_id',
                             'who_id', 'what', 'where_value', 'token_count']
         if sort_by not in valid_sort_columns:
             sort_by = 'when_ts'
-        
-        # Build main query
+
+        # Build main query - only fetch memories with valid embeddings
         query = f"""
-            SELECT 
-                memory_id, session_id, source_event_id,
-                who_type, who_id, who_label, who_list,
-                what, when_ts, when_list,
-                where_type, where_value, where_list,
-                why, how, 
-                raw_text, token_count, extra_json,
-                created_at
-            FROM memories{where_clause}
-            ORDER BY {sort_by} {sort_order}
+            SELECT
+                m.memory_id, m.session_id, m.source_event_id,
+                m.who_type, m.who_id, m.who_label, m.who_list,
+                m.what, m.when_ts, m.when_list,
+                m.where_type, m.where_value, m.where_list,
+                m.why, m.how,
+                m.raw_text, m.token_count, m.extra_json,
+                m.created_at
+            FROM memories m
+            INNER JOIN embeddings e ON m.memory_id = e.memory_id
+            {where_clause.replace('WHERE', 'WHERE e.vector IS NOT NULL AND') if where_clause else 'WHERE e.vector IS NOT NULL'}
+            ORDER BY m.{sort_by} {sort_order}
             LIMIT ? OFFSET ?
         """
         
@@ -358,16 +365,18 @@ def get_memory(memory_id):
         con.row_factory = sqlite3.Row
         
         query = """
-            SELECT 
-                memory_id, session_id, source_event_id,
-                who_type, who_id, who_label, who_list,
-                what, when_ts, when_list,
-                where_type, where_value, where_list,
-                why, how, 
-                raw_text, token_count, extra_json,
-                created_at
-            FROM memories
-            WHERE memory_id = ?
+            SELECT
+                m.memory_id, m.session_id, m.source_event_id,
+                m.who_type, m.who_id, m.who_label, m.who_list,
+                m.what, m.when_ts, m.when_list,
+                m.where_type, m.where_value, m.where_list,
+                m.why, m.how,
+                m.raw_text, m.token_count, m.extra_json,
+                m.created_at
+            FROM memories m
+            INNER JOIN embeddings e ON m.memory_id = e.memory_id
+            WHERE m.memory_id = ?
+            AND e.vector IS NOT NULL
         """
         
         cursor = con.cursor()
@@ -443,45 +452,49 @@ def export_memories():
             # Export specific memories
             placeholders = ','.join(['?' for _ in memory_ids])
             query = f"""
-                SELECT * FROM memories 
-                WHERE memory_id IN ({placeholders})
-                ORDER BY when_ts DESC
+                SELECT m.* FROM memories m
+                INNER JOIN embeddings e ON m.memory_id = e.memory_id
+                WHERE m.memory_id IN ({placeholders})
+                AND e.vector IS NOT NULL
+                ORDER BY m.when_ts DESC
             """
             rows = con.execute(query, memory_ids).fetchall()
         else:
             # Export based on filters (similar to browse query)
-            query = "SELECT * FROM memories WHERE 1=1"
+            query = """SELECT m.* FROM memories m
+                INNER JOIN embeddings e ON m.memory_id = e.memory_id
+                WHERE e.vector IS NOT NULL"""
             params = []
             
             # Apply filters
             if filters.get('search'):
-                query += " AND (raw_text LIKE ? OR what LIKE ? OR why LIKE ? OR how LIKE ?)"
+                query += " AND (m.raw_text LIKE ? OR m.what LIKE ? OR m.why LIKE ? OR m.how LIKE ?)"
                 search_term = f"%{filters['search']}%"
                 params.extend([search_term] * 4)
-            
+
             if filters.get('session_id'):
-                query += " AND session_id LIKE ?"
+                query += " AND m.session_id LIKE ?"
                 params.append(f"%{filters['session_id']}%")
-            
+
             if filters.get('who'):
-                query += " AND (who_type LIKE ? OR who_id LIKE ?)"
+                query += " AND (m.who_type LIKE ? OR m.who_id LIKE ?)"
                 who_term = f"%{filters['who']}%"
                 params.extend([who_term, who_term])
-            
+
             if filters.get('where'):
-                query += " AND (where_type LIKE ? OR where_value LIKE ?)"
+                query += " AND (m.where_type LIKE ? OR m.where_value LIKE ?)"
                 where_term = f"%{filters['where']}%"
                 params.extend([where_term, where_term])
-            
+
             if filters.get('date_from'):
-                query += " AND when_ts >= ?"
+                query += " AND m.when_ts >= ?"
                 params.append(filters['date_from'])
-            
+
             if filters.get('date_to'):
-                query += " AND when_ts <= ?"
+                query += " AND m.when_ts <= ?"
                 params.append(filters['date_to'])
-            
-            query += " ORDER BY when_ts DESC"
+
+            query += " ORDER BY m.when_ts DESC"
             rows = con.execute(query, params).fetchall()
         
         con.close()

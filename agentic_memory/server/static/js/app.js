@@ -1,11 +1,11 @@
 // Global state
 let currentWeights = {
-    semantic: 0.68,
-    recency: 0.02,
-    actor: 0.10,
-    temporal: 0.10,
-    spatial: 0.05,
-    usage: 0.05
+    semantic: 0.84,
+    recency: 0.00,
+    actor: 0.00,
+    temporal: 0.08,
+    spatial: 0.04,
+    usage: 0.04
 };
 
 let currentResults = [];
@@ -267,12 +267,12 @@ async function resetWeights() {
         console.error('Failed to reset weights:', error);
         // Fallback to local defaults
         currentWeights = {
-            semantic: 0.68,
-            recency: 0.02,
-            actor: 0.10,
-            temporal: 0.10,
-            spatial: 0.05,
-            usage: 0.05
+            semantic: 0.84,
+            recency: 0.00,
+            actor: 0.00,
+            temporal: 0.08,
+            spatial: 0.04,
+            usage: 0.04
         };
         updateWeightDisplay();
     }

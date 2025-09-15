@@ -1137,32 +1137,32 @@ input:checked + .toggle-slider:before {
                                     <div class="weight-slider-mini">
                                         <label>Semantic</label>
                                         <input type="range" id="chat-weight-semantic" min="0" max="100" value="68" onchange="updateWeight('semantic', this.value)">
-                                        <span id="chat-weight-semantic-val">0.68</span>
+                                        <span id="chat-weight-semantic-val">0.84</span>
                                     </div>
                                     <div class="weight-slider-mini">
                                         <label>Recency</label>
                                         <input type="range" id="chat-weight-recency" min="0" max="100" value="2" onchange="updateWeight('recency', this.value)">
-                                        <span id="chat-weight-recency-val">0.02</span>
+                                        <span id="chat-weight-recency-val">0.00</span>
                                     </div>
                                     <div class="weight-slider-mini">
                                         <label>Actor</label>
                                         <input type="range" id="chat-weight-actor" min="0" max="100" value="10" onchange="updateWeight('actor', this.value)">
-                                        <span id="chat-weight-actor-val">0.10</span>
+                                        <span id="chat-weight-actor-val">0.00</span>
                                     </div>
                                     <div class="weight-slider-mini">
                                         <label>Temporal</label>
                                         <input type="range" id="chat-weight-temporal" min="0" max="100" value="10" onchange="updateWeight('temporal', this.value)">
-                                        <span id="chat-weight-temporal-val">0.10</span>
+                                        <span id="chat-weight-temporal-val">0.08</span>
                                     </div>
                                     <div class="weight-slider-mini">
                                         <label>Spatial</label>
                                         <input type="range" id="chat-weight-spatial" min="0" max="100" value="5" onchange="updateWeight('spatial', this.value)">
-                                        <span id="chat-weight-spatial-val">0.05</span>
+                                        <span id="chat-weight-spatial-val">0.04</span>
                                     </div>
                                     <div class="weight-slider-mini">
                                         <label>Usage</label>
                                         <input type="range" id="chat-weight-usage" min="0" max="100" value="5" onchange="updateWeight('usage', this.value)">
-                                        <span id="chat-weight-usage-val">0.05</span>
+                                        <span id="chat-weight-usage-val">0.04</span>
                                     </div>
                                 </div>
                             </div>
@@ -1965,12 +1965,12 @@ async function fetchWeights() {
         console.error('Error fetching weights:', error);
         // Use default weights if fetch fails
         currentWeights = {
-            semantic: 0.68,
-            recency: 0.02,
-            actor: 0.10,
-            temporal: 0.10,
-            spatial: 0.05,
-            usage: 0.05
+            semantic: 0.84,
+            recency: 0.00,
+            actor: 0.00,
+            temporal: 0.08,
+            spatial: 0.04,
+            usage: 0.04
         };
         updateChatWeightDisplay();
     }
@@ -2112,12 +2112,12 @@ async function resetWeights() {
         console.error('Failed to reset weights:', error);
         // Fallback to local defaults
         currentWeights = {
-            semantic: 0.68,
-            recency: 0.02,
-            actor: 0.10,
-            temporal: 0.10,
-            spatial: 0.05,
-            usage: 0.05
+            semantic: 0.84,
+            recency: 0.00,
+            actor: 0.00,
+            temporal: 0.08,
+            spatial: 0.04,
+            usage: 0.04
         };
         updateChatWeightDisplay();
     }
